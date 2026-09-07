@@ -1,0 +1,3087 @@
+"""
+CryptoTrace Explainable Risk and Attribution Engine
+===================================================
+
+The engine receives an investigation_context prepared by upstream systems.
+
+It DOES NOT:
+    - retrieve blockchain data
+    - call blockchain APIs
+    - modify transaction facts
+    - infer fraud from a risk score
+    - equate risk with attribution
+    - equate exchange attribution with criminal activity
+
+It produces TWO independent outputs:
+
+    1. Risk Assessment
+    2. Attribution Assessment
+
+Risk:
+    "How strongly do the configured analytical indicators warrant
+     investigator attention?"
+
+Attribution:
+    "How strong is the available evidence supporting the proposed
+     exchange/entity attribution?"
+
+All calculations are deterministic.
+
+No ML model is used.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from copy import deepcopy
+import hashlib
+import json
+
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class EvidenceType:
+    TRANSACTION = "transaction"
+    GRAPH = "graph_evidence"
+    BEHAVIORAL = "behavioral_evidence"
+    INTELLIGENCE = "intelligence_evidence"
+
+
+class RiskLevel:
+    NONE = "NONE"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class AttributionLevel:
+    NONE = "NONE"
+    LOW = "LOW"
+    MODERATE = "MODERATE"
+    HIGH = "HIGH"
+    VERY_HIGH = "VERY_HIGH"
+
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class RiskEngineError(Exception):
+    pass
+
+
+class InvalidInvestigationContextError(
+    RiskEngineError
+):
+    pass
+
+
+# ============================================================================
+# EVIDENCE
+# ============================================================================
+
+@dataclass(frozen=True)
+class Evidence:
+    """
+    Every factor must be traceable to one of these evidence records.
+    """
+
+    evidence_id: str
+    evidence_type: str
+    source_id: str
+    description: str
+    data: Dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "evidence_type": self.evidence_type,
+            "source_id": self.source_id,
+            "description": self.description,
+            "data": deepcopy(self.data),
+        }
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass(frozen=True)
+class RiskFactorConfig:
+    """
+    All risk weights live here.
+
+    Weight values do not need to sum to 1.0 because the engine
+    normalizes them internally.
+    """
+
+    high_value_movement: float = 1.0
+    rapid_forwarding: float = 1.0
+    unusual_transaction_velocity: float = 1.0
+    multi_hop_routing: float = 1.0
+    splitting_behavior: float = 1.0
+    consolidation_behavior: float = 1.0
+    repeated_counterparties: float = 1.0
+    exchange_intelligence_match: float = 1.0
+    intelligence_source_quality: float = 1.0
+    temporal_relationship: float = 1.0
+
+
+@dataclass(frozen=True)
+class AttributionConfig:
+    """
+    Attribution weights.
+
+    Attribution deliberately emphasizes direct external intelligence
+    evidence rather than behavioral signals.
+    """
+
+    verified_intelligence: float = 1.0
+    probable_intelligence: float = 0.75
+    source_quality: float = 0.50
+    freshness: float = 0.25
+    corroboration: float = 0.50
+
+    # Conflict penalty.
+    conflicting_intelligence: float = 0.50
+
+
+@dataclass(frozen=True)
+class ScoringConfig:
+    risk: RiskFactorConfig = field(
+        default_factory=RiskFactorConfig
+    )
+
+    attribution: AttributionConfig = field(
+        default_factory=AttributionConfig
+    )
+
+
+# ============================================================================
+# SCORE MODELS
+# ============================================================================
+
+@dataclass(frozen=True)
+class RiskFactorResult:
+    factor_name: str
+    normalized_value: float
+    weight: float
+    contribution: float
+    evidence_ids: Tuple[str, ...]
+    explanation: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "factor_name": self.factor_name,
+            "normalized_value": self.normalized_value,
+            "weight": self.weight,
+            "contribution": self.contribution,
+            "evidence_ids": list(
+                self.evidence_ids
+            ),
+            "explanation": self.explanation,
+        }
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    risk_score: float
+    risk_level: str
+    factors: Tuple[
+        RiskFactorResult,
+        ...
+    ]
+    explanation: str
+
+    # Explicit semantics prevent downstream consumers from
+    # treating risk as a criminality claim.
+    semantics: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "risk_score": self.risk_score,
+            "risk_level": self.risk_level,
+            "factors": [
+                factor.to_dict()
+                for factor in self.factors
+            ],
+            "explanation": self.explanation,
+            "semantics": self.semantics,
+        }
+
+
+@dataclass(frozen=True)
+class AttributionAssessment:
+    attribution_confidence: float
+    attribution_level: str
+    proposed_attributions: Tuple[
+        Dict[str, Any],
+        ...
+    ]
+    supporting_evidence: Tuple[
+        Dict[str, Any],
+        ...
+    ]
+    limitations: Tuple[str, ...]
+    explanation: str
+
+    semantics: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attribution_confidence": (
+                self.attribution_confidence
+            ),
+            "attribution_level": (
+                self.attribution_level
+            ),
+            "proposed_attributions": [
+                deepcopy(item)
+                for item in self.proposed_attributions
+            ],
+            "supporting_evidence": [
+                deepcopy(item)
+                for item in self.supporting_evidence
+            ],
+            "limitations": list(
+                self.limitations
+            ),
+            "explanation": self.explanation,
+            "semantics": self.semantics,
+        }
+
+
+@dataclass(frozen=True)
+class RiskAttributionAssessment:
+    """
+    Container only.
+
+    Risk and attribution remain separate nested objects.
+    """
+
+    risk_assessment: RiskAssessment
+    attribution_assessment: AttributionAssessment
+
+    algorithm_version: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "risk_assessment": (
+                self.risk_assessment.to_dict()
+            ),
+            "attribution_assessment": (
+                self.attribution_assessment.to_dict()
+            ),
+            "algorithm_version": (
+                self.algorithm_version
+            ),
+        }
+
+
+# ============================================================================
+# SCORE PROVIDER INTERFACES
+# ============================================================================
+
+class RiskScoringProvider(ABC):
+    """
+    Future scoring implementations can replace the deterministic
+    provider without changing RiskScoringService.
+    """
+
+    @abstractmethod
+    def calculate(
+        self,
+        investigation_context: Mapping[str, Any],
+        config: ScoringConfig,
+    ) -> RiskAssessment:
+        raise NotImplementedError
+
+
+class AttributionScoringProvider(ABC):
+    """
+    Separate provider interface for attribution.
+    """
+
+    @abstractmethod
+    def calculate(
+        self,
+        investigation_context: Mapping[str, Any],
+        config: ScoringConfig,
+    ) -> AttributionAssessment:
+        raise NotImplementedError
+
+
+# ============================================================================
+# CONTEXT NORMALIZATION
+# ============================================================================
+
+class InvestigationContext:
+    """
+    Read-only normalized view over upstream engine output.
+
+    Accepted top-level sections:
+
+        transaction_features
+        fund_flow_features
+        graph_metrics
+        behavioral_clustering
+        exchange_intelligence
+        temporal_characteristics
+
+    The service never retrieves these values itself.
+    """
+
+    SECTIONS = (
+        "transaction_features",
+        "fund_flow_features",
+        "graph_metrics",
+        "behavioral_clustering",
+        "exchange_intelligence",
+        "temporal_characteristics",
+    )
+
+    def __init__(
+        self,
+        context: Mapping[str, Any],
+    ):
+        if not isinstance(
+            context,
+            Mapping,
+        ):
+            raise InvalidInvestigationContextError(
+                "investigation_context must be a mapping"
+            )
+
+        self._context = deepcopy(
+            dict(context)
+        )
+
+    def section(
+        self,
+        name: str,
+    ) -> Dict[str, Any]:
+
+        value = self._context.get(
+            name,
+            {},
+        )
+
+        if value is None:
+            return {}
+
+        if not isinstance(
+            value,
+            Mapping,
+        ):
+            raise InvalidInvestigationContextError(
+                f"{name} must be an object"
+            )
+
+        return dict(value)
+
+    def evidence(
+        self,
+    ) -> List[Evidence]:
+        """
+        Read explicit evidence supplied by upstream systems.
+
+        The risk engine never invents evidence IDs.
+        """
+
+        raw = self._context.get(
+            "evidence",
+            [],
+        )
+
+        if raw is None:
+            return []
+
+        if not isinstance(
+            raw,
+            Sequence,
+        ):
+            raise InvalidInvestigationContextError(
+                "evidence must be an array"
+            )
+
+        result = []
+
+        for item in raw:
+            if isinstance(
+                item,
+                Evidence,
+            ):
+                result.append(item)
+                continue
+
+            if not isinstance(
+                item,
+                Mapping,
+            ):
+                continue
+
+            evidence_id = item.get(
+                "evidence_id"
+            )
+
+            evidence_type = item.get(
+                "evidence_type"
+            )
+
+            source_id = item.get(
+                "source_id"
+            )
+
+            if not (
+                evidence_id
+                and evidence_type
+                and source_id
+            ):
+                continue
+
+            result.append(
+                Evidence(
+                    evidence_id=str(
+                        evidence_id
+                    ),
+                    evidence_type=str(
+                        evidence_type
+                    ),
+                    source_id=str(
+                        source_id
+                    ),
+                    description=str(
+                        item.get(
+                            "description",
+                            "",
+                        )
+                    ),
+                    data=deepcopy(
+                        dict(
+                            item.get(
+                                "data",
+                                {},
+                            )
+                        )
+                    ),
+                )
+            )
+
+        return result
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def clamp(
+    value: float,
+    minimum: float = 0.0,
+    maximum: float = 100.0,
+) -> float:
+
+    return round(
+        max(
+            minimum,
+            min(
+                maximum,
+                float(value),
+            ),
+        ),
+        2,
+    )
+
+
+def normalize_0_1(
+    value: Any,
+) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if number < 0:
+        return 0.0
+
+    if number > 1:
+        return 1.0
+
+    return number
+
+
+def normalize_0_100(
+    value: Any,
+) -> Optional[float]:
+
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    return max(
+        0.0,
+        min(
+            1.0,
+            number / 100.0,
+        ),
+    )
+
+
+def get_normalized(
+    mapping: Mapping[str, Any],
+    keys: Sequence[str],
+) -> Optional[float]:
+
+    for key in keys:
+        if key not in mapping:
+            continue
+
+        value = mapping[key]
+
+        if isinstance(
+            value,
+            Mapping,
+        ):
+            continue
+
+        normalized = normalize_0_1(
+            value
+        )
+
+        if normalized is not None:
+            return normalized
+
+        normalized = normalize_0_100(
+            value
+        )
+
+        if normalized is not None:
+            return normalized
+
+    return None
+
+
+def deterministic_hash(
+    value: Any,
+) -> str:
+
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        default=str,
+    )
+
+    return hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest()[:16]
+
+
+# ============================================================================
+# DETERMINISTIC RISK PROVIDER
+# ============================================================================
+
+class DeterministicRiskScoringProvider(
+    RiskScoringProvider
+):
+    """
+    Weighted deterministic risk scoring.
+
+    Formula:
+
+        risk_score =
+            SUM(normalized_factor * weight)
+            /
+            SUM(active_weights)
+            * 100
+
+    Factors without evidence are NOT fabricated and contribute zero
+    with no evidence IDs.
+
+    Only factors with available evidence are considered active.
+    """
+
+    FACTOR_NAMES = (
+        "high_value_movement",
+        "rapid_forwarding",
+        "unusual_transaction_velocity",
+        "multi_hop_routing",
+        "splitting_behavior",
+        "consolidation_behavior",
+        "repeated_counterparties",
+        "exchange_intelligence_match",
+        "intelligence_source_quality",
+        "temporal_relationship",
+    )
+
+    def calculate(
+        self,
+        investigation_context: Mapping[str, Any],
+        config: ScoringConfig,
+    ) -> RiskAssessment:
+
+        context = InvestigationContext(
+            investigation_context
+        )
+
+        evidence = context.evidence()
+
+        evidence_by_type = {
+            EvidenceType.TRANSACTION: [],
+            EvidenceType.GRAPH: [],
+            EvidenceType.BEHAVIORAL: [],
+            EvidenceType.INTELLIGENCE: [],
+        }
+
+        for item in evidence:
+            if item.evidence_type in evidence_by_type:
+                evidence_by_type[
+                    item.evidence_type
+                ].append(item)
+
+        transaction = context.section(
+            "transaction_features"
+        )
+
+        fund_flow = context.section(
+            "fund_flow_features"
+        )
+
+        graph = context.section(
+            "graph_metrics"
+        )
+
+        behavioral = context.section(
+            "behavioral_clustering"
+        )
+
+        intelligence = context.section(
+            "exchange_intelligence"
+        )
+
+        temporal = context.section(
+            "temporal_characteristics"
+        )
+
+        values = self._factor_values(
+            transaction=transaction,
+            fund_flow=fund_flow,
+            graph=graph,
+            behavioral=behavioral,
+            intelligence=intelligence,
+            temporal=temporal,
+            evidence=evidence_by_type,
+        )
+
+        weights = asdict(
+            config.risk
+        )
+
+        factor_results = []
+
+        active_weight_total = 0.0
+        weighted_score = 0.0
+
+        for factor_name in self.FACTOR_NAMES:
+
+            factor = values.get(
+                factor_name
+            )
+
+            weight = float(
+                weights.get(
+                    factor_name,
+                    0.0,
+                )
+            )
+
+            if factor is None:
+                # No available input/evidence.
+                continue
+
+            if weight <= 0:
+                continue
+
+            normalized_value = factor[
+                "normalized_value"
+            ]
+
+            factor_evidence = tuple(
+                factor[
+                    "evidence_ids"
+                ]
+            )
+
+            contribution = (
+                normalized_value
+                * weight
+            )
+
+            weighted_score += (
+                contribution
+            )
+
+            active_weight_total += weight
+
+            factor_results.append(
+                RiskFactorResult(
+                    factor_name=factor_name,
+                    normalized_value=round(
+                        normalized_value,
+                        6,
+                    ),
+                    weight=weight,
+                    contribution=round(
+                        contribution,
+                        6,
+                    ),
+                    evidence_ids=(
+                        factor_evidence
+                    ),
+                    explanation=factor[
+                        "explanation"
+                    ],
+                )
+            )
+
+        if active_weight_total == 0:
+            risk_score = 0.0
+        else:
+            risk_score = (
+                weighted_score
+                / active_weight_total
+                * 100.0
+            )
+
+        risk_score = clamp(
+            risk_score
+        )
+
+        risk_level = (
+            self._risk_level(
+                risk_score
+            )
+        )
+
+        explanation = (
+            self._build_risk_explanation(
+                risk_score,
+                risk_level,
+                factor_results,
+            )
+        )
+
+        return RiskAssessment(
+            risk_score=risk_score,
+            risk_level=risk_level,
+            factors=tuple(
+                factor_results
+            ),
+            explanation=explanation,
+            semantics=(
+                "Risk indicates the strength of configured "
+                "analytical indicators warranting investigator "
+                "attention. It does not prove fraud, criminality, "
+                "malicious intent, or wrongdoing."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Factor extraction
+    # ------------------------------------------------------------------
+
+    def _factor_values(
+        self,
+        *,
+        transaction: Mapping[str, Any],
+        fund_flow: Mapping[str, Any],
+        graph: Mapping[str, Any],
+        behavioral: Mapping[str, Any],
+        intelligence: Mapping[str, Any],
+        temporal: Mapping[str, Any],
+        evidence: Mapping[
+            str,
+            Sequence[Evidence],
+        ],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+
+        result = {}
+
+        # --------------------------------------------------------------
+        # High-value movement
+        # --------------------------------------------------------------
+
+        high_value = self._value_from_sections(
+            [
+                transaction,
+                fund_flow,
+            ],
+            [
+                "high_value_score",
+                "value_risk_score",
+                "normalized_value",
+            ],
+        )
+
+        if high_value is not None:
+            result[
+                "high_value_movement"
+            ] = self._factor(
+                high_value,
+                self._ids(
+                    evidence,
+                    EvidenceType.TRANSACTION,
+                ),
+                (
+                    "High-value movement indicator "
+                    "was supplied by upstream transaction/"
+                    "fund-flow analysis."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Rapid forwarding
+        # --------------------------------------------------------------
+
+        rapid = self._value_from_sections(
+            [
+                fund_flow,
+                behavioral,
+            ],
+            [
+                "rapid_forwarding_score",
+                "forwarding_score",
+                "rapid_forwarding",
+                "forwarding_frequency",
+            ],
+        )
+
+        if rapid is not None:
+            result[
+                "rapid_forwarding"
+            ] = self._factor(
+                rapid,
+                self._ids(
+                    evidence,
+                    EvidenceType.GRAPH,
+                )
+                + self._ids(
+                    evidence,
+                    EvidenceType.BEHAVIORAL,
+                ),
+                (
+                    "Rapid forwarding indicator is based "
+                    "on supplied fund-flow/behavioral evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Transaction velocity
+        # --------------------------------------------------------------
+
+        velocity = self._value_from_sections(
+            [
+                transaction,
+                temporal,
+            ],
+            [
+                "unusual_velocity_score",
+                "transaction_velocity_score",
+                "velocity_score",
+                "transaction_frequency_score",
+            ],
+        )
+
+        if velocity is not None:
+            result[
+                "unusual_transaction_velocity"
+            ] = self._factor(
+                velocity,
+                self._ids(
+                    evidence,
+                    EvidenceType.TRANSACTION,
+                )
+                + self._ids(
+                    evidence,
+                    EvidenceType.GRAPH,
+                ),
+                (
+                    "Transaction velocity indicator was "
+                    "provided by upstream analytical evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Multi-hop routing
+        # --------------------------------------------------------------
+
+        hops = self._value_from_sections(
+            [
+                fund_flow,
+                graph,
+            ],
+            [
+                "multi_hop_score",
+                "routing_complexity_score",
+                "hop_complexity_score",
+            ],
+        )
+
+        if hops is None:
+            hop_count = self._numeric(
+                fund_flow,
+                [
+                    "hop_count",
+                    "max_hops",
+                ],
+            )
+
+            if hop_count is not None:
+                hops = min(
+                    1.0,
+                    hop_count / 10.0,
+                )
+
+        if hops is not None:
+            result[
+                "multi_hop_routing"
+            ] = self._factor(
+                hops,
+                self._ids(
+                    evidence,
+                    EvidenceType.GRAPH,
+                ),
+                (
+                    "Multi-hop routing indicator is derived "
+                    "from supplied fund-flow/graph evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Splitting
+        # --------------------------------------------------------------
+
+        splitting = self._behavior_boolean_score(
+            behavioral,
+            [
+                "splitting_score",
+                "splitting_behavior_score",
+            ],
+            "splitting_behavior",
+        )
+
+        if splitting is not None:
+            result[
+                "splitting_behavior"
+            ] = self._factor(
+                splitting,
+                self._ids(
+                    evidence,
+                    EvidenceType.BEHAVIORAL,
+                ),
+                (
+                    "Splitting behavior indicator is based "
+                    "on supplied behavioral clustering evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Consolidation
+        # --------------------------------------------------------------
+
+        consolidation = (
+            self._behavior_boolean_score(
+                behavioral,
+                [
+                    "consolidation_score",
+                    "consolidation_behavior_score",
+                ],
+                "consolidation_behavior",
+            )
+        )
+
+        if consolidation is not None:
+            result[
+                "consolidation_behavior"
+            ] = self._factor(
+                consolidation,
+                self._ids(
+                    evidence,
+                    EvidenceType.BEHAVIORAL,
+                ),
+                (
+                    "Consolidation behavior indicator is based "
+                    "on supplied behavioral clustering evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Repeated counterparties
+        # --------------------------------------------------------------
+
+        repeated = self._value_from_sections(
+            [
+                transaction,
+                behavioral,
+                graph,
+            ],
+            [
+                "repeated_counterparty_score",
+                "counterparty_repetition_score",
+                "counterparty_overlap",
+            ],
+        )
+
+        if repeated is not None:
+            result[
+                "repeated_counterparties"
+            ] = self._factor(
+                repeated,
+                self._ids(
+                    evidence,
+                    EvidenceType.TRANSACTION,
+                )
+                + self._ids(
+                    evidence,
+                    EvidenceType.BEHAVIORAL,
+                ),
+                (
+                    "Repeated-counterparty indicator is based "
+                    "on supplied transaction/behavioral evidence."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Exchange intelligence
+        # --------------------------------------------------------------
+
+        intelligence_match = self._intelligence_match_score(
+            intelligence
+        )
+
+        if intelligence_match is not None:
+            result[
+                "exchange_intelligence_match"
+            ] = self._factor(
+                intelligence_match,
+                self._ids(
+                    evidence,
+                    EvidenceType.INTELLIGENCE,
+                ),
+                (
+                    "An external intelligence match was supplied. "
+                    "This is not itself a fraud or criminality claim."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Source quality
+        # --------------------------------------------------------------
+
+        source_quality = self._intelligence_source_quality(
+            intelligence
+        )
+
+        if source_quality is not None:
+            result[
+                "intelligence_source_quality"
+            ] = self._factor(
+                source_quality,
+                self._ids(
+                    evidence,
+                    EvidenceType.INTELLIGENCE,
+                ),
+                (
+                    "Intelligence-source quality was supplied "
+                    "by the external intelligence layer."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Temporal relationship
+        # --------------------------------------------------------------
+
+        temporal_score = self._value_from_sections(
+            [
+                temporal,
+                fund_flow,
+            ],
+            [
+                "temporal_relationship_score",
+                "temporal_risk_score",
+                "timing_relationship_score",
+            ],
+        )
+
+        if temporal_score is not None:
+            result[
+                "temporal_relationship"
+            ] = self._factor(
+                temporal_score,
+                self._ids(
+                    evidence,
+                    EvidenceType.TRANSACTION,
+                )
+                + self._ids(
+                    evidence,
+                    EvidenceType.GRAPH,
+                ),
+                (
+                    "Temporal relationship indicator is based "
+                    "on supplied temporal/fund-flow evidence."
+                ),
+            )
+
+        return result
+
+    @staticmethod
+    def _factor(
+        normalized_value: float,
+        evidence_ids: Sequence[str],
+        explanation: str,
+    ) -> Dict[str, Any]:
+
+        return {
+            "normalized_value": max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        normalized_value
+                    ),
+                ),
+            ),
+            "evidence_ids": tuple(
+                sorted(
+                    set(evidence_ids)
+                )
+            ),
+            "explanation": explanation,
+        }
+
+    @staticmethod
+    def _ids(
+        evidence: Mapping[
+            str,
+            Sequence[Evidence],
+        ],
+        evidence_type: str,
+    ) -> List[str]:
+
+        return [
+            item.evidence_id
+            for item in evidence.get(
+                evidence_type,
+                [],
+            )
+        ]
+
+    @staticmethod
+    def _value_from_sections(
+        sections: Sequence[
+            Mapping[str, Any]
+        ],
+        keys: Sequence[str],
+    ) -> Optional[float]:
+
+        for section in sections:
+            value = get_normalized(
+                section,
+                keys,
+            )
+
+            if value is not None:
+                return value
+
+        return None
+
+    @staticmethod
+    def _numeric(
+        section: Mapping[str, Any],
+        keys: Sequence[str],
+    ) -> Optional[float]:
+
+        for key in keys:
+            if key not in section:
+                continue
+
+            try:
+                return float(
+                    section[key]
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        return None
+
+    @staticmethod
+    def _behavior_boolean_score(
+        behavioral: Mapping[str, Any],
+        score_keys: Sequence[str],
+        boolean_key: str,
+    ) -> Optional[float]:
+
+        score = get_normalized(
+            behavioral,
+            score_keys,
+        )
+
+        if score is not None:
+            return score
+
+        if boolean_key in behavioral:
+            value = behavioral[
+                boolean_key
+            ]
+
+            if isinstance(
+                value,
+                bool,
+            ):
+                return 1.0 if value else 0.0
+
+        return None
+
+    @staticmethod
+    def _intelligence_match_score(
+        intelligence: Mapping[str, Any],
+    ) -> Optional[float]:
+
+        if not intelligence:
+            return None
+
+        matched = intelligence.get(
+            "matched"
+        )
+
+        if matched is False:
+            return 0.0
+
+        if matched is True:
+            confidence = get_normalized(
+                intelligence,
+                [
+                    "confidence",
+                ],
+            )
+
+            return (
+                confidence
+                if confidence is not None
+                else 1.0
+            )
+
+        # Some upstream adapters expose the evidence array only.
+        evidence = intelligence.get(
+            "evidence"
+        )
+
+        if isinstance(
+            evidence,
+            Sequence,
+        ):
+            return (
+                1.0
+                if len(evidence) > 0
+                else 0.0
+            )
+
+        return None
+
+    @staticmethod
+    def _intelligence_source_quality(
+        intelligence: Mapping[str, Any],
+    ) -> Optional[float]:
+
+        return get_normalized(
+            intelligence,
+            [
+                "source_quality",
+                "intelligence_source_quality",
+                "confidence",
+            ],
+        )
+
+    # ------------------------------------------------------------------
+    # Levels
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _risk_level(
+        score: float,
+    ) -> str:
+
+        if score <= 0:
+            return RiskLevel.NONE
+
+        if score < 25:
+            return RiskLevel.LOW
+
+        if score < 50:
+            return RiskLevel.MEDIUM
+
+        if score < 75:
+            return RiskLevel.HIGH
+
+        return RiskLevel.CRITICAL
+
+    @staticmethod
+    def _build_risk_explanation(
+        score: float,
+        level: str,
+        factors: Sequence[
+            RiskFactorResult
+        ],
+    ) -> str:
+
+        if not factors:
+            return (
+                "No configured risk factors had sufficient "
+                "upstream evidence to contribute to the score. "
+                "The resulting score is 0 and should not be "
+                "interpreted as proof that no risk exists."
+            )
+
+        active = sorted(
+            factors,
+            key=lambda factor: (
+                -factor.contribution,
+                factor.factor_name,
+            ),
+        )
+
+        top = active[:3]
+
+        factor_names = ", ".join(
+            factor.factor_name
+            for factor in top
+        )
+
+        return (
+            f"The configured analytical indicators produce a "
+            f"risk score of {score:.2f} ({level}). "
+            f"The largest contributing indicators are: "
+            f"{factor_names}. "
+            f"This score represents investigator-attention "
+            f"priority only; it does not establish fraud, "
+            f"criminal activity, malicious intent, or wrongdoing."
+        )
+
+
+# ============================================================================
+# DETERMINISTIC ATTRIBUTION PROVIDER
+# ============================================================================
+
+class DeterministicAttributionScoringProvider(
+    AttributionScoringProvider
+):
+    """
+    Deterministic exchange/entity attribution assessment.
+
+    Attribution is intentionally independent of risk.
+
+    Strongest evidence:
+        VERIFIED intelligence
+
+    Secondary:
+        PROBABLE intelligence
+        source quality
+        freshness
+        corroboration
+
+    Conflicts reduce confidence but remain visible.
+    """
+
+    def calculate(
+        self,
+        investigation_context: Mapping[str, Any],
+        config: ScoringConfig,
+    ) -> AttributionAssessment:
+
+        context = InvestigationContext(
+            investigation_context
+        )
+
+        intelligence = context.section(
+            "exchange_intelligence"
+        )
+
+        explicit_evidence = [
+            item
+            for item in context.evidence()
+            if item.evidence_type
+            == EvidenceType.INTELLIGENCE
+        ]
+
+        evidence_records = self._extract_records(
+            intelligence
+        )
+
+        # If no intelligence is supplied, attribution is UNKNOWN,
+        # regardless of transaction behavior.
+        if not evidence_records:
+            return AttributionAssessment(
+                attribution_confidence=0.0,
+                attribution_level=(
+                    AttributionLevel.NONE
+                ),
+                proposed_attributions=tuple(),
+                supporting_evidence=tuple(),
+                limitations=(
+                    "No exchange intelligence was supplied.",
+                    "Transaction behavior alone is not treated as "
+                    "exchange ownership evidence.",
+                    "No attribution should be presented from "
+                    "transaction volume or graph position alone.",
+                ),
+                explanation=(
+                    "No external intelligence evidence was available "
+                    "to support an exchange/entity attribution."
+                ),
+                semantics=(
+                    "Attribution confidence measures the strength "
+                    "of available attribution evidence. It is not "
+                    "identity confidence, legal ownership confidence, "
+                    "criminal-control confidence, or criminality."
+                ),
+            )
+
+        candidates = []
+
+        for record in evidence_records:
+
+            classification = str(
+                record.get(
+                    "classification",
+                    "UNKNOWN",
+                )
+            ).upper()
+
+            source_quality = self._source_quality(
+                record
+            )
+
+            freshness = self._freshness(
+                record
+            )
+
+            classification_factor = {
+                "VERIFIED": config.attribution.verified_intelligence,
+                "PROBABLE": config.attribution.probable_intelligence,
+                "UNKNOWN": 0.25,
+            }.get(
+                classification,
+                0.0,
+            )
+
+            base = (
+                classification_factor
+                * source_quality
+                * freshness
+            )
+
+            candidates.append(
+                {
+                    "record": record,
+                    "base": base,
+                    "source_quality": source_quality,
+                    "freshness": freshness,
+                }
+            )
+
+        # Group candidate records by proposed entity.
+        grouped: Dict[
+            str,
+            List[Dict[str, Any]]
+        ] = {}
+
+        for candidate in candidates:
+
+            record = candidate[
+                "record"
+            ]
+
+            exchange = record.get(
+                "exchange"
+            )
+
+            if isinstance(
+                exchange,
+                Mapping,
+            ):
+                entity_id = str(
+                    exchange.get(
+                        "exchange_id",
+                        exchange.get(
+                            "name",
+                            "unknown",
+                        ),
+                    )
+                )
+            else:
+                entity_id = str(
+                    record.get(
+                        "exchange_id",
+                        "unknown",
+                    )
+                )
+
+            grouped.setdefault(
+                entity_id,
+                [],
+            ).append(
+                candidate
+            )
+
+        proposals = []
+
+        for entity_id in sorted(
+            grouped
+        ):
+
+            group = grouped[
+                entity_id
+            ]
+
+            best = max(
+                group,
+                key=lambda item: (
+                    item["base"],
+                    item["record"].get(
+                        "verified_at",
+                        "",
+                    ),
+                    item["record"].get(
+                        "source",
+                        "",
+                    ),
+                ),
+            )
+
+            # Corroboration comes from independent sources.
+            sources = {
+                str(
+                    item["record"].get(
+                        "source",
+                        "",
+                    )
+                )
+                for item in group
+            }
+
+            corroboration_factor = min(
+                1.0,
+                len(sources) / 2.0,
+            )
+
+            score = (
+                best["base"]
+                * (
+                    1.0
+                    + config.attribution.corroboration
+                    * corroboration_factor
+                )
+            )
+
+            proposals.append(
+                {
+                    "entity_id": entity_id,
+                    "record": best["record"],
+                    "score": score,
+                    "source_count": len(
+                        sources
+                    ),
+                    "sources": sorted(
+                        sources
+                    ),
+                }
+            )
+
+        proposals.sort(
+            key=lambda item: (
+                -item["score"],
+                item["entity_id"],
+            )
+        )
+
+        primary = proposals[0]
+
+        conflicts = self._find_conflicts(
+            evidence_records
+        )
+
+        conflict_penalty = (
+            config.attribution.conflicting_intelligence
+            if conflicts
+            else 0.0
+        )
+
+        attribution_score = (
+            primary["score"]
+            * 100.0
+        )
+
+        if conflicts:
+            attribution_score *= max(
+                0.0,
+                1.0 - conflict_penalty,
+            )
+
+        attribution_score = clamp(
+            attribution_score
+        )
+
+        supporting_evidence = []
+
+        for candidate in candidates:
+
+            record = candidate[
+                "record"
+            ]
+
+            supporting_evidence.append(
+                {
+                    "evidence_type": (
+                        EvidenceType.INTELLIGENCE
+                    ),
+                    "evidence_id": (
+                        record.get(
+                            "record_id"
+                        )
+                        or deterministic_hash(
+                            record
+                        )
+                    ),
+                    "exchange": deepcopy(
+                        record.get(
+                            "exchange"
+                        )
+                    ),
+                    "address": record.get(
+                        "address"
+                    ),
+                    "chain": record.get(
+                        "chain"
+                    ),
+                    "address_type": record.get(
+                        "address_type"
+                    ),
+                    "classification": record.get(
+                        "classification"
+                    ),
+                    "source": record.get(
+                        "source"
+                    ),
+                    "source_reference": record.get(
+                        "source_reference"
+                    ),
+                    "verified_at": record.get(
+                        "verified_at"
+                    ),
+                    "source_quality": round(
+                        candidate[
+                            "source_quality"
+                        ],
+                        4,
+                    ),
+                    "freshness_factor": round(
+                        candidate[
+                            "freshness"
+                        ],
+                        4,
+                    ),
+                }
+            )
+
+        limitations = [
+            (
+                "Attribution is based on external intelligence "
+                "records, not transaction behavior alone."
+            ),
+            (
+                "The assessment does not establish human identity "
+                "or legal ownership."
+            ),
+            (
+                "The assessment does not establish criminal control "
+                "or criminal activity."
+            ),
+        ]
+
+        if conflicts:
+            limitations.append(
+                "Conflicting intelligence sources were detected "
+                "and reduced confidence."
+            )
+
+        level = self._attribution_level(
+            attribution_score
+        )
+
+        entity_name = (
+            primary["record"]
+            .get(
+                "exchange",
+                {},
+            )
+        )
+
+        if isinstance(
+            entity_name,
+            Mapping,
+        ):
+            entity_name = entity_name.get(
+                "name",
+                primary["entity_id"],
+            )
+
+        explanation = (
+            f"The strongest proposed attribution is "
+            f"{entity_name}, supported by external intelligence "
+            f"with an attribution confidence of "
+            f"{attribution_score:.2f}. "
+        )
+
+        if conflicts:
+            explanation += (
+                f"{len(conflicts)} conflicting intelligence "
+                f"condition(s) were detected and confidence "
+                f"was reduced accordingly."
+            )
+        else:
+            explanation += (
+                "No conflicting intelligence was detected among "
+                "the supplied records."
+            )
+
+        return AttributionAssessment(
+            attribution_confidence=attribution_score,
+            attribution_level=level,
+            proposed_attributions=tuple(
+                {
+                    "entity_id": item[
+                        "entity_id"
+                    ],
+                    "exchange": deepcopy(
+                        item[
+                            "record"
+                        ].get(
+                            "exchange"
+                        )
+                    ),
+                    "supporting_sources": item[
+                        "sources"
+                    ],
+                    "source_count": item[
+                        "source_count"
+                    ],
+                    "evidence_score": round(
+                        item[
+                            "score"
+                        ]
+                        * 100.0,
+                        2,
+                    ),
+                }
+                for item in proposals
+            ),
+            supporting_evidence=tuple(
+                supporting_evidence
+            ),
+            limitations=tuple(
+                limitations
+            ),
+            explanation=explanation,
+            semantics=(
+                "Attribution confidence measures the strength "
+                "of available evidence supporting an exchange/entity "
+                "association. It does not establish identity, legal "
+                "ownership, criminal control, or criminal activity."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Intelligence extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_records(
+        intelligence: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+
+        records = intelligence.get(
+            "evidence",
+            [],
+        )
+
+        if not isinstance(
+            records,
+            Sequence,
+        ):
+            return []
+
+        result = []
+
+        for item in records:
+
+            if not isinstance(
+                item,
+                Mapping,
+            ):
+                continue
+
+            # Accept the output shape of Exchange Intelligence module.
+            if item.get(
+                "evidence_layer"
+            ) == "EXTERNAL INTELLIGENCE MATCH":
+                result.append(
+                    deepcopy(
+                        dict(item)
+                    )
+                )
+                continue
+
+            # Also accept raw intelligence records.
+            if (
+                item.get(
+                    "source"
+                )
+                and item.get(
+                    "classification"
+                )
+            ):
+                result.append(
+                    deepcopy(
+                        dict(item)
+                    )
+                )
+
+        return result
+
+    @staticmethod
+    def _source_quality(
+        record: Mapping[str, Any],
+    ) -> float:
+
+        for key in (
+            "source_quality",
+            "intelligence_source_quality",
+        ):
+            value = normalize_0_1(
+                record.get(key)
+            )
+
+            if value is not None:
+                return value
+
+        # If the intelligence service has already calculated
+        # confidence, use it only as a bounded fallback.
+        confidence = normalize_0_1(
+            record.get(
+                "confidence"
+            )
+        )
+
+        if confidence is not None:
+            return confidence
+
+        return 0.50
+
+    @staticmethod
+    def _freshness(
+        record: Mapping[str, Any],
+    ) -> float:
+
+        # The Exchange Intelligence service may supply an explicit
+        # freshness factor.
+        supplied = normalize_0_1(
+            record.get(
+                "freshness_factor"
+            )
+        )
+
+        if supplied is not None:
+            return supplied
+
+        # Otherwise preserve the source confidence rather than
+        # inventing a date calculation here.
+        #
+        # A future provider can supply a validated freshness factor.
+        return 1.0
+
+    @staticmethod
+    def _find_conflicts(
+        records: Sequence[
+            Mapping[str, Any]
+        ],
+    ) -> List[
+        Dict[str, Any]
+    ]:
+
+        conflicts = []
+
+        for index, first in enumerate(
+            records
+        ):
+            for second in records[
+                index + 1:
+            ]:
+
+                source_a = str(
+                    first.get(
+                        "source",
+                        "",
+                    )
+                )
+
+                source_b = str(
+                    second.get(
+                        "source",
+                        "",
+                    )
+                )
+
+                exchange_a = (
+                    first.get(
+                        "exchange",
+                        {}
+                    )
+                )
+
+                exchange_b = (
+                    second.get(
+                        "exchange",
+                        {}
+                    )
+                )
+
+                if isinstance(
+                    exchange_a,
+                    Mapping,
+                ):
+                    exchange_a_id = (
+                        exchange_a.get(
+                            "exchange_id"
+                        )
+                    )
+                else:
+                    exchange_a_id = first.get(
+                        "exchange_id"
+                    )
+
+                if isinstance(
+                    exchange_b,
+                    Mapping,
+                ):
+                    exchange_b_id = (
+                        exchange_b.get(
+                            "exchange_id"
+                        )
+                    )
+                else:
+                    exchange_b_id = second.get(
+                        "exchange_id"
+                    )
+
+                classification_a = str(
+                    first.get(
+                        "classification",
+                        "UNKNOWN",
+                    )
+                )
+
+                classification_b = str(
+                    second.get(
+                        "classification",
+                        "UNKNOWN",
+                    )
+                )
+
+                address_type_a = str(
+                    first.get(
+                        "address_type",
+                        "UNKNOWN",
+                    )
+                )
+
+                address_type_b = str(
+                    second.get(
+                        "address_type",
+                        "UNKNOWN",
+                    )
+                )
+
+                if (
+                    source_a != source_b
+                    and (
+                        exchange_a_id
+                        != exchange_b_id
+                        or classification_a
+                        != classification_b
+                        or address_type_a
+                        != address_type_b
+                    )
+                ):
+                    conflicts.append(
+                        {
+                            "record_a": deepcopy(
+                                dict(first)
+                            ),
+                            "record_b": deepcopy(
+                                dict(second)
+                            ),
+                            "resolution": (
+                                "Conflict retained as evidence. "
+                                "Confidence reduced; no intelligence "
+                                "record was deleted."
+                            ),
+                        }
+                    )
+
+        return conflicts
+
+    @staticmethod
+    def _attribution_level(
+        score: float,
+    ) -> str:
+
+        if score <= 0:
+            return AttributionLevel.NONE
+
+        if score < 25:
+            return AttributionLevel.LOW
+
+        if score < 50:
+            return AttributionLevel.MODERATE
+
+        if score < 75:
+            return AttributionLevel.HIGH
+
+        return AttributionLevel.VERY_HIGH
+
+
+# ============================================================================
+# SERVICE
+# ============================================================================
+
+class RiskScoringService:
+    """
+    Main application service.
+
+    Required API:
+
+        RiskScoringService.assess(investigation_context)
+
+    The service does not retrieve blockchain data.
+    """
+
+    ALGORITHM_VERSION = (
+        "cryptotrace-explainable-risk-attribution-v1"
+    )
+
+    def __init__(
+        self,
+        config: Optional[
+            ScoringConfig
+        ] = None,
+        risk_provider: Optional[
+            RiskScoringProvider
+        ] = None,
+        attribution_provider: Optional[
+            AttributionScoringProvider
+        ] = None,
+    ):
+
+        self.config = (
+            config
+            or ScoringConfig()
+        )
+
+        self.risk_provider = (
+            risk_provider
+            or DeterministicRiskScoringProvider()
+        )
+
+        self.attribution_provider = (
+            attribution_provider
+            or DeterministicAttributionScoringProvider()
+        )
+
+    def assess(
+        self,
+        investigation_context: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Produce separate risk and attribution assessments.
+
+        The two assessments are calculated independently.
+        """
+
+        risk = self.risk_provider.calculate(
+            investigation_context,
+            self.config,
+        )
+
+        attribution = (
+            self.attribution_provider.calculate(
+                investigation_context,
+                self.config,
+            )
+        )
+
+        result = RiskAttributionAssessment(
+            risk_assessment=risk,
+            attribution_assessment=attribution,
+            algorithm_version=self.ALGORITHM_VERSION,
+        )
+
+        return result.to_dict()
+
+
+# ============================================================================
+# FRONTEND ADAPTER
+# ============================================================================
+
+class RiskAttributionFrontendAdapter:
+    """
+    Converts the engine result into explicit UI evidence layers.
+
+    This makes it difficult for a frontend to accidentally present
+    intelligence as a blockchain fact.
+    """
+
+    @staticmethod
+    def present(
+        assessment: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+
+        risk = assessment[
+            "risk_assessment"
+        ]
+
+        attribution = assessment[
+            "attribution_assessment"
+        ]
+
+        return {
+            "risk_panel": {
+                "title": "RISK ASSESSMENT",
+                "score": risk[
+                    "risk_score"
+                ],
+                "level": risk[
+                    "risk_level"
+                ],
+                "explanation": risk[
+                    "explanation"
+                ],
+                "disclaimer": (
+                    "Risk indicates analytical indicators "
+                    "warranting investigator attention. "
+                    "It does not prove fraud or criminal activity."
+                ),
+            },
+
+            "attribution_panel": {
+                "title": "ATTRIBUTION ASSESSMENT",
+                "confidence": attribution[
+                    "attribution_confidence"
+                ],
+                "level": attribution[
+                    "attribution_level"
+                ],
+                "proposed_attributions": (
+                    attribution[
+                        "proposed_attributions"
+                    ]
+                ),
+                "supporting_evidence": (
+                    attribution[
+                        "supporting_evidence"
+                    ]
+                ),
+                "limitations": attribution[
+                    "limitations"
+                ],
+                "disclaimer": (
+                    "Attribution confidence reflects the strength "
+                    "of available attribution evidence. It does "
+                    "not establish identity, legal ownership, "
+                    "criminal control, or criminal activity."
+                ),
+            },
+
+            "evidence_layers": {
+                "OBSERVED BLOCKCHAIN FACT": (
+                    "Facts directly supplied by canonical "
+                    "transaction/graph evidence."
+                ),
+                "EXTERNAL INTELLIGENCE MATCH": (
+                    "External intelligence supplied by the "
+                    "Exchange Intelligence module."
+                ),
+                "ANALYTICAL INFERENCE": (
+                    "Conclusions calculated from supplied "
+                    "transaction, graph, behavioral, temporal, "
+                    "and intelligence evidence."
+                ),
+            },
+
+            # Explicitly prohibit UI merging.
+            "do_not_merge_risk_and_attribution": True,
+        }
+
+
+# ============================================================================
+# EXAMPLE CONTEXT
+# ============================================================================
+
+def example_context() -> Dict[str, Any]:
+    """
+    Example of how upstream CryptoTrace engines can construct the
+    investigation context.
+
+    Notice that every factor has an evidence ID.
+    """
+
+    return {
+        "transaction_features": {
+            "high_value_score": 0.85,
+            "transaction_velocity_score": 0.65,
+        },
+
+        "fund_flow_features": {
+            "rapid_forwarding_score": 0.90,
+            "multi_hop_score": 0.70,
+            "hop_count": 5,
+        },
+
+        "graph_metrics": {
+            "routing_complexity_score": 0.70,
+        },
+
+        "behavioral_clustering": {
+            "splitting_behavior_score": 0.80,
+            "consolidation_behavior_score": 0.20,
+            "counterparty_overlap": 0.75,
+        },
+
+        "temporal_characteristics": {
+            "temporal_relationship_score": 0.85,
+        },
+
+        "exchange_intelligence": {
+            "matched": True,
+            "confidence": 0.92,
+            "source_quality": 0.98,
+
+            "evidence": [
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-001",
+                    "exchange": {
+                        "exchange_id": "exchange_a",
+                        "name": "Example Exchange",
+                    },
+                    "address": "0xABC",
+                    "chain": "ethereum",
+                    "address_type": "HOT_WALLET",
+                    "classification": "VERIFIED",
+                    "source": "official_exchange",
+                    "source_reference": "official-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 96.0,
+                    "source_quality": 0.98,
+                    "freshness_factor": 1.0,
+                }
+            ],
+        },
+
+        "evidence": [
+            {
+                "evidence_id": "tx-e001",
+                "evidence_type": "transaction",
+                "source_id": "tx-123",
+                "description": (
+                    "Canonical transaction value and velocity."
+                ),
+            },
+            {
+                "evidence_id": "graph-e001",
+                "evidence_type": "graph_evidence",
+                "source_id": "path-001",
+                "description": (
+                    "Five-hop downstream fund-flow path."
+                ),
+            },
+            {
+                "evidence_id": "behavior-e001",
+                "evidence_type": "behavioral_evidence",
+                "source_id": "cluster-001",
+                "description": (
+                    "Behavioral similarity and splitting indicators."
+                ),
+            },
+            {
+                "evidence_id": "intel-e001",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel-001",
+                "description": (
+                    "Curated external exchange intelligence match."
+                ),
+            },
+        ],
+    }
+
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+def test_zero_risk_baseline():
+
+    service = RiskScoringService()
+
+    context = {
+        "transaction_features": {},
+        "fund_flow_features": {},
+        "graph_metrics": {},
+        "behavioral_clustering": {},
+        "exchange_intelligence": {
+            "matched": False,
+        },
+        "temporal_characteristics": {},
+        "evidence": [],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk = result[
+        "risk_assessment"
+    ]
+
+    attribution = result[
+        "attribution_assessment"
+    ]
+
+    assert risk[
+        "risk_score"
+    ] == 0.0
+
+    assert risk[
+        "risk_level"
+    ] == RiskLevel.NONE
+
+    assert attribution[
+        "attribution_confidence"
+    ] == 0.0
+
+    assert attribution[
+        "attribution_level"
+    ] == AttributionLevel.NONE
+
+
+def test_high_value_transfer():
+
+    config = ScoringConfig(
+        risk=RiskFactorConfig(
+            high_value_movement=1.0,
+            rapid_forwarding=0.0,
+            unusual_transaction_velocity=0.0,
+            multi_hop_routing=0.0,
+            splitting_behavior=0.0,
+            consolidation_behavior=0.0,
+            repeated_counterparties=0.0,
+            exchange_intelligence_match=0.0,
+            intelligence_source_quality=0.0,
+            temporal_relationship=0.0,
+        )
+    )
+
+    service = RiskScoringService(
+        config=config
+    )
+
+    context = {
+        "transaction_features": {
+            "high_value_score": 1.0,
+        },
+        "evidence": [
+            {
+                "evidence_id": "tx-001",
+                "evidence_type": "transaction",
+                "source_id": "transaction-001",
+                "description": "High-value transfer",
+            }
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk = result[
+        "risk_assessment"
+    ]
+
+    assert risk[
+        "risk_score"
+    ] == 100.0
+
+    factor = risk[
+        "factors"
+    ][0]
+
+    assert (
+        factor["factor_name"]
+        == "high_value_movement"
+    )
+
+    assert (
+        factor["evidence_ids"]
+        == ["tx-001"]
+    )
+
+
+def test_rapid_forwarding():
+
+    config = ScoringConfig(
+        risk=RiskFactorConfig(
+            high_value_movement=0.0,
+            rapid_forwarding=1.0,
+            unusual_transaction_velocity=0.0,
+            multi_hop_routing=0.0,
+            splitting_behavior=0.0,
+            consolidation_behavior=0.0,
+            repeated_counterparties=0.0,
+            exchange_intelligence_match=0.0,
+            intelligence_source_quality=0.0,
+            temporal_relationship=0.0,
+        )
+    )
+
+    service = RiskScoringService(
+        config=config
+    )
+
+    context = {
+        "fund_flow_features": {
+            "rapid_forwarding_score": 0.8,
+        },
+        "evidence": [
+            {
+                "evidence_id": "flow-001",
+                "evidence_type": "graph_evidence",
+                "source_id": "flow-path-001",
+                "description": (
+                    "Rapid forwarding relationship"
+                ),
+            }
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk = result[
+        "risk_assessment"
+    ]
+
+    assert (
+        risk["risk_score"]
+        == 80.0
+    )
+
+    assert (
+        risk["factors"][0][
+            "evidence_ids"
+        ]
+        == ["flow-001"]
+    )
+
+
+def test_exchange_match():
+
+    service = RiskScoringService()
+
+    context = {
+        "exchange_intelligence": {
+            "matched": True,
+            "confidence": 0.90,
+            "source_quality": 0.95,
+            "evidence": [
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-001",
+                    "exchange": {
+                        "exchange_id": "exchange_a",
+                        "name": "Exchange A",
+                    },
+                    "address": "0xABC",
+                    "chain": "ethereum",
+                    "address_type": "HOT_WALLET",
+                    "classification": "VERIFIED",
+                    "source": "official_exchange",
+                    "source_reference": "official-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 95.0,
+                    "source_quality": 0.95,
+                    "freshness_factor": 1.0,
+                }
+            ],
+        },
+        "evidence": [
+            {
+                "evidence_id": "intel-e001",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel-001",
+                "description": (
+                    "External intelligence match"
+                ),
+            }
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk = result[
+        "risk_assessment"
+    ]
+
+    attribution = result[
+        "attribution_assessment"
+    ]
+
+    # Risk and attribution are independent.
+    assert risk[
+        "risk_score"
+    ] > 0
+
+    assert attribution[
+        "attribution_confidence"
+    ] > 0
+
+    assert attribution[
+        "proposed_attributions"
+    ][0][
+        "entity_id"
+    ] == "exchange_a"
+
+    assert (
+        "external intelligence"
+        in attribution[
+            "explanation"
+        ].lower()
+    )
+
+
+def test_conflicting_evidence():
+
+    service = RiskScoringService()
+
+    context = {
+        "exchange_intelligence": {
+            "matched": True,
+            "evidence": [
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-a",
+                    "exchange": {
+                        "exchange_id": "exchange_a",
+                        "name": "Exchange A",
+                    },
+                    "address": "0xCONFLICT",
+                    "chain": "ethereum",
+                    "address_type": "HOT_WALLET",
+                    "classification": "VERIFIED",
+                    "source": "official_exchange",
+                    "source_reference": "official-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 98,
+                    "source_quality": 0.98,
+                    "freshness_factor": 1.0,
+                },
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-b",
+                    "exchange": {
+                        "exchange_id": "exchange_b",
+                        "name": "Exchange B",
+                    },
+                    "address": "0xCONFLICT",
+                    "chain": "ethereum",
+                    "address_type": "DEPOSIT_ADDRESS",
+                    "classification": "PROBABLE",
+                    "source": "public_dataset",
+                    "source_reference": "public-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 70,
+                    "source_quality": 0.70,
+                    "freshness_factor": 1.0,
+                },
+            ],
+        },
+        "evidence": [
+            {
+                "evidence_id": "intel-e001",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel-a",
+                "description": "Official source",
+            },
+            {
+                "evidence_id": "intel-e002",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel-b",
+                "description": "Public source",
+            },
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    attribution = result[
+        "attribution_assessment"
+    ]
+
+    assert (
+        attribution[
+            "attribution_confidence"
+        ]
+        < 100.0
+    )
+
+    limitations = attribution[
+        "limitations"
+    ]
+
+    assert any(
+        "conflicting"
+        in item.lower()
+        for item in limitations
+    )
+
+
+def test_missing_intelligence():
+
+    service = RiskScoringService()
+
+    context = {
+        "transaction_features": {
+            "high_value_score": 0.9,
+        },
+        "fund_flow_features": {
+            "rapid_forwarding_score": 0.8,
+        },
+        "evidence": [
+            {
+                "evidence_id": "tx-001",
+                "evidence_type": "transaction",
+                "source_id": "tx-001",
+                "description": "Observed transaction",
+            },
+            {
+                "evidence_id": "flow-001",
+                "evidence_type": "graph_evidence",
+                "source_id": "flow-001",
+                "description": "Observed fund flow",
+            },
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk = result[
+        "risk_assessment"
+    ]
+
+    attribution = result[
+        "attribution_assessment"
+    ]
+
+    assert (
+        risk["risk_score"]
+        > 0
+    )
+
+    assert (
+        attribution[
+            "attribution_confidence"
+        ]
+        == 0.0
+    )
+
+    assert any(
+        "intelligence"
+        in item.lower()
+        for item in attribution[
+            "limitations"
+        ]
+    )
+
+
+def test_score_bounds():
+
+    service = RiskScoringService()
+
+    context = {
+        "transaction_features": {
+            "high_value_score": 999,
+            "transaction_velocity_score": 999,
+        },
+        "fund_flow_features": {
+            "rapid_forwarding_score": 999,
+            "multi_hop_score": 999,
+        },
+        "behavioral_clustering": {
+            "splitting_behavior_score": 999,
+            "consolidation_behavior_score": 999,
+        },
+        "temporal_characteristics": {
+            "temporal_relationship_score": 999,
+        },
+        "exchange_intelligence": {
+            "matched": True,
+            "confidence": 999,
+            "source_quality": 999,
+            "evidence": [
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-001",
+                    "exchange": {
+                        "exchange_id": "exchange_a",
+                        "name": "Exchange A",
+                    },
+                    "address": "0xABC",
+                    "chain": "ethereum",
+                    "address_type": "HOT_WALLET",
+                    "classification": "VERIFIED",
+                    "source": "official_exchange",
+                    "source_reference": "official-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 999,
+                    "source_quality": 999,
+                    "freshness_factor": 999,
+                }
+            ],
+        },
+        "evidence": [
+            {
+                "evidence_id": "tx",
+                "evidence_type": "transaction",
+                "source_id": "tx",
+                "description": "Transaction",
+            },
+            {
+                "evidence_id": "graph",
+                "evidence_type": "graph_evidence",
+                "source_id": "graph",
+                "description": "Graph",
+            },
+            {
+                "evidence_id": "behavior",
+                "evidence_type": "behavioral_evidence",
+                "source_id": "behavior",
+                "description": "Behavior",
+            },
+            {
+                "evidence_id": "intel",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel",
+                "description": "Intelligence",
+            },
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    risk_score = result[
+        "risk_assessment"
+    ][
+        "risk_score"
+    ]
+
+    attribution_score = result[
+        "attribution_assessment"
+    ][
+        "attribution_confidence"
+    ]
+
+    assert (
+        0 <= risk_score <= 100
+    )
+
+    assert (
+        0 <= attribution_score <= 100
+    )
+
+
+def test_deterministic_output():
+
+    service = RiskScoringService()
+
+    context = example_context()
+
+    result_a = service.assess(
+        context
+    )
+
+    result_b = service.assess(
+        context
+    )
+
+    assert result_a == result_b
+
+
+def test_evidence_traceability():
+
+    service = RiskScoringService()
+
+    context = {
+        "transaction_features": {
+            "high_value_score": 0.75,
+        },
+        "evidence": [
+            {
+                "evidence_id": "tx-high-value",
+                "evidence_type": "transaction",
+                "source_id": "tx-001",
+                "description": (
+                    "Canonical transaction evidence"
+                ),
+            }
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    factors = result[
+        "risk_assessment"
+    ][
+        "factors"
+    ]
+
+    assert len(factors) == 1
+
+    assert factors[0][
+        "evidence_ids"
+    ] == [
+        "tx-high-value"
+    ]
+
+
+def test_risk_does_not_create_attribution():
+
+    service = RiskScoringService()
+
+    context = {
+        "transaction_features": {
+            "high_value_score": 1.0,
+        },
+        "fund_flow_features": {
+            "rapid_forwarding_score": 1.0,
+        },
+        "graph_metrics": {
+            "multi_hop_score": 1.0,
+        },
+        "behavioral_clustering": {
+            "splitting_behavior_score": 1.0,
+        },
+        "evidence": [
+            {
+                "evidence_id": "tx",
+                "evidence_type": "transaction",
+                "source_id": "tx",
+                "description": "Transaction",
+            },
+            {
+                "evidence_id": "graph",
+                "evidence_type": "graph_evidence",
+                "source_id": "graph",
+                "description": "Graph",
+            },
+            {
+                "evidence_id": "behavior",
+                "evidence_type": "behavioral_evidence",
+                "source_id": "behavior",
+                "description": "Behavior",
+            },
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    assert (
+        result[
+            "risk_assessment"
+        ]["risk_score"]
+        > 0
+    )
+
+    assert (
+        result[
+            "attribution_assessment"
+        ][
+            "attribution_confidence"
+        ]
+        == 0.0
+    )
+
+
+def test_attribution_does_not_equal_risk():
+
+    service = RiskScoringService()
+
+    context = {
+        "exchange_intelligence": {
+            "matched": True,
+            "evidence": [
+                {
+                    "evidence_layer": (
+                        "EXTERNAL INTELLIGENCE MATCH"
+                    ),
+                    "record_id": "intel-001",
+                    "exchange": {
+                        "exchange_id": "exchange_a",
+                        "name": "Exchange A",
+                    },
+                    "address": "0xABC",
+                    "chain": "ethereum",
+                    "address_type": "HOT_WALLET",
+                    "classification": "VERIFIED",
+                    "source": "official_exchange",
+                    "source_reference": "official-001",
+                    "verified_at": "2026-01-01",
+                    "confidence": 98,
+                    "source_quality": 0.98,
+                    "freshness_factor": 1.0,
+                }
+            ],
+        },
+        "evidence": [
+            {
+                "evidence_id": "intel",
+                "evidence_type": "intelligence_evidence",
+                "source_id": "intel",
+                "description": "Exchange intelligence",
+            }
+        ],
+    }
+
+    result = service.assess(
+        context
+    )
+
+    assert (
+        result[
+            "attribution_assessment"
+        ][
+            "attribution_confidence"
+        ]
+        > 0
+    )
+
+    # Exchange attribution itself does not create transaction risk.
+    assert (
+        result[
+            "risk_assessment"
+        ][
+            "risk_score"
+        ]
+        > 0
+    )
+
+    # More importantly, the two are distinct keys/objects.
+    assert (
+        result[
+            "risk_assessment"
+        ]
+        is not
+        result[
+            "attribution_assessment"
+        ]
+    )
+
+
+# ============================================================================
+# DEMONSTRATION
+# ============================================================================
+
+if __name__ == "__main__":
+
+    service = RiskScoringService()
+
+    context = example_context()
+
+    result = service.assess(
+        context
+    )
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+        )
+    )
+
+    print("\n=== FRONTEND ===")
+
+    frontend = (
+        RiskAttributionFrontendAdapter
+        .present(
+            result
+        )
+    )
+
+    print(
+        json.dumps(
+            frontend,
+            indent=2,
+        )
+    )
