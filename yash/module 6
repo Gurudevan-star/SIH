@@ -1,0 +1,1780 @@
+"""
+CryptoTrace Multi-Hop Fund Tracing Engine
+=========================================
+
+Dependencies:
+    pip install networkx pytest
+
+Design:
+    Node = (chain, address)
+    Edge = canonical asset transfer
+
+The engine:
+    - Does NOT call blockchain APIs.
+    - Does NOT infer ownership.
+    - Does NOT classify addresses as criminal.
+    - Supports downstream/upstream tracing.
+    - Supports max hops.
+    - Supports minimum value filtering.
+    - Supports time-window filtering.
+    - Supports asset filtering.
+    - Handles cycles.
+    - Preserves transaction-level evidence.
+    - Uses deterministic ordering.
+    - Supports multiple assets and chains.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Iterable, Mapping, Optional
+
+import networkx as nx
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass(frozen=True)
+class CanonicalTransfer:
+    """
+    Canonical normalized asset transfer.
+
+    Every transfer becomes one directed graph edge.
+    """
+
+    transaction_id: str
+    transaction_hash: str
+    chain: str
+
+    from_address: str
+    to_address: str
+
+    asset: str
+    amount: Decimal
+
+    timestamp: datetime
+    block_number: int
+
+    hop_number: int = 0
+
+    @classmethod
+    def from_mapping(
+        cls,
+        tx: Mapping[str, Any],
+    ) -> "CanonicalTransfer":
+
+        timestamp = tx["timestamp"]
+
+        if isinstance(timestamp, str):
+            timestamp = timestamp.replace("Z", "+00:00")
+            timestamp = datetime.fromisoformat(timestamp)
+
+        return cls(
+            transaction_id=str(tx["transaction_id"]),
+            transaction_hash=str(tx["transaction_hash"]),
+            chain=str(tx["chain"]),
+            from_address=str(tx["from_address"]),
+            to_address=str(tx["to_address"]),
+            asset=str(tx["asset"]),
+            amount=Decimal(str(tx["amount"])),
+            timestamp=timestamp,
+            block_number=int(tx["block_number"]),
+            hop_number=int(tx.get("hop_number", 0)),
+        )
+
+    def edge_attributes(self) -> dict[str, Any]:
+        return {
+            "transaction_id": self.transaction_id,
+            "transaction_hash": self.transaction_hash,
+            "chain": self.chain,
+            "asset": self.asset,
+            "amount": self.amount,
+            "timestamp": self.timestamp,
+            "block_number": self.block_number,
+            "hop_number": self.hop_number,
+        }
+
+
+@dataclass(frozen=True)
+class TraceFilters:
+    """
+    Configurable traversal filters.
+    """
+
+    min_value: Optional[Decimal] = None
+
+    assets: Optional[frozenset[str]] = None
+
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
+    direction: Optional[str] = None
+
+    def matches(
+        self,
+        edge: Mapping[str, Any],
+    ) -> bool:
+
+        # Asset filter
+        if self.assets is not None:
+            if edge["asset"] not in self.assets:
+                return False
+
+        # Minimum value filter
+        if self.min_value is not None:
+            amount = Decimal(str(edge["amount"]))
+
+            if amount < self.min_value:
+                return False
+
+        # Time window
+        timestamp = edge["timestamp"]
+
+        if self.start_time is not None:
+            if timestamp < self.start_time:
+                return False
+
+        if self.end_time is not None:
+            if timestamp > self.end_time:
+                return False
+
+        return True
+
+
+@dataclass
+class StoredPath:
+    """
+    Exact transaction-level path.
+    """
+
+    path_id: str
+
+    direction: str
+
+    source: tuple[str, str]
+
+    destination: tuple[str, str]
+
+    nodes: list[tuple[str, str]]
+
+    edges: list[dict[str, Any]]
+
+
+# ============================================================
+# ENGINE
+# ============================================================
+
+class CryptoTraceEngine:
+    """
+    NetworkX-based multi-hop fund tracing engine.
+
+    Node identity:
+        (chain, address)
+
+    Edge:
+        canonical asset transfer
+
+    No blockchain APIs are accessed by this class.
+    """
+
+    def __init__(
+        self,
+        default_max_hops: int = 5,
+    ):
+
+        if default_max_hops < 0:
+            raise ValueError(
+                "default_max_hops must be >= 0"
+            )
+
+        self.default_max_hops = default_max_hops
+
+        # MultiDiGraph is required because multiple transfers
+        # may occur between the same addresses.
+        self.graph = nx.MultiDiGraph()
+
+        # Exact reconstructed paths.
+        self._paths: dict[str, StoredPath] = {}
+
+    # ========================================================
+    # BUILD GRAPH
+    # ========================================================
+
+    def build_graph(
+        self,
+        transactions: Iterable[
+            CanonicalTransfer | Mapping[str, Any]
+        ],
+    ) -> dict[str, Any]:
+
+        self.graph.clear()
+        self._paths.clear()
+
+        normalized = []
+
+        for transaction in transactions:
+
+            if isinstance(
+                transaction,
+                CanonicalTransfer,
+            ):
+                normalized.append(transaction)
+
+            else:
+                normalized.append(
+                    CanonicalTransfer.from_mapping(
+                        transaction
+                    )
+                )
+
+        # Deterministic transaction order.
+        normalized.sort(
+            key=self._transaction_sort_key
+        )
+
+        for transaction in normalized:
+
+            source = (
+                transaction.chain,
+                transaction.from_address,
+            )
+
+            destination = (
+                transaction.chain,
+                transaction.to_address,
+            )
+
+            # Add source node.
+            self.graph.add_node(
+                source,
+                chain=transaction.chain,
+                address=transaction.from_address,
+            )
+
+            # Add destination node.
+            self.graph.add_node(
+                destination,
+                chain=transaction.chain,
+                address=transaction.to_address,
+            )
+
+            # Stable transaction edge ID.
+            edge_id = self._edge_key(transaction)
+
+            self.graph.add_edge(
+                source,
+                destination,
+                key=edge_id,
+                **transaction.edge_attributes(),
+            )
+
+        return self._result(
+            paths=[],
+            traversal_metadata={
+                "operation": "build_graph",
+                "max_hops": 0,
+                "visited_nodes": self.graph.number_of_nodes(),
+                "visited_edges": self.graph.number_of_edges(),
+            },
+        )
+
+    # ========================================================
+    # DOWNSTREAM
+    # ========================================================
+
+    def trace_downstream(
+        self,
+        source: str | tuple[str, str],
+        max_hops: Optional[int] = None,
+        filters: Optional[TraceFilters] = None,
+    ) -> dict[str, Any]:
+
+        return self._trace(
+            source=source,
+            max_hops=max_hops,
+            filters=filters,
+            direction="downstream",
+        )
+
+    # ========================================================
+    # UPSTREAM
+    # ========================================================
+
+    def trace_upstream(
+        self,
+        source: str | tuple[str, str],
+        max_hops: Optional[int] = None,
+        filters: Optional[TraceFilters] = None,
+    ) -> dict[str, Any]:
+
+        return self._trace(
+            source=source,
+            max_hops=max_hops,
+            filters=filters,
+            direction="upstream",
+        )
+
+    # ========================================================
+    # INTERNAL TRACE
+    # ========================================================
+
+    def _trace(
+        self,
+        source: str | tuple[str, str],
+        max_hops: Optional[int],
+        filters: Optional[TraceFilters],
+        direction: str,
+    ) -> dict[str, Any]:
+
+        if max_hops is None:
+            max_hops = self.default_max_hops
+
+        if max_hops < 0:
+            raise ValueError(
+                "max_hops must be >= 0"
+            )
+
+        filters = filters or TraceFilters()
+
+        if filters.direction is not None:
+
+            if filters.direction != direction:
+                raise ValueError(
+                    "Filter direction does not match "
+                    "trace direction"
+                )
+
+        source_node = self._resolve_node(source)
+
+        if source_node not in self.graph:
+
+            return self._result(
+                paths=[],
+                traversal_metadata={
+                    "operation": f"trace_{direction}",
+                    "source": source_node,
+                    "max_hops": max_hops,
+                    "visited_nodes": 0,
+                    "visited_edges": 0,
+                    "path_count": 0,
+                    "truncated": False,
+                },
+            )
+
+        # Queue:
+        #
+        # current node
+        # current depth
+        # nodes already in this path
+        # edges already in this path
+        queue = deque(
+            [
+                (
+                    source_node,
+                    0,
+                    [source_node],
+                    [],
+                )
+            ]
+        )
+
+        discovered_paths: list[StoredPath] = []
+
+        visited_nodes: set[
+            tuple[str, str]
+        ] = set()
+
+        visited_edges: set[
+            tuple[Any, ...]
+        ] = set()
+
+        while queue:
+
+            (
+                current_node,
+                depth,
+                current_nodes,
+                current_edges,
+            ) = queue.popleft()
+
+            visited_nodes.add(current_node)
+
+            # Hop limit.
+            if depth >= max_hops:
+                continue
+
+            # Select traversal direction.
+            if direction == "downstream":
+
+                edge_iterator = self.graph.out_edges(
+                    current_node,
+                    keys=True,
+                    data=True,
+                )
+
+            else:
+
+                edge_iterator = self.graph.in_edges(
+                    current_node,
+                    keys=True,
+                    data=True,
+                )
+
+            # Deterministic edge ordering.
+            edges = sorted(
+                edge_iterator,
+                key=self._edge_sort_key,
+            )
+
+            for (
+                u,
+                v,
+                edge_key,
+                attributes,
+            ) in edges:
+
+                # Apply filters BEFORE expansion.
+                if not filters.matches(attributes):
+                    continue
+
+                visited_edges.add(
+                    (u, v, edge_key)
+                )
+
+                if direction == "downstream":
+                    next_node = v
+                else:
+                    next_node = u
+
+                # ------------------------------------------------
+                # CYCLE PROTECTION
+                # ------------------------------------------------
+
+                # A -> B -> C -> A is not expanded indefinitely.
+                #
+                # We allow the graph itself to contain cycles,
+                # but a single evidence path must remain simple.
+                if next_node in current_nodes:
+                    continue
+
+                next_edge = self._serialize_edge(
+                    u,
+                    v,
+                    edge_key,
+                    attributes,
+                )
+
+                next_nodes = (
+                    current_nodes + [next_node]
+                )
+
+                next_edges = (
+                    current_edges + [next_edge]
+                )
+
+                path_id = self._make_path_id(
+                    direction,
+                    next_nodes,
+                    next_edges,
+                )
+
+                stored_path = StoredPath(
+                    path_id=path_id,
+                    direction=direction,
+                    source=source_node,
+                    destination=next_node,
+                    nodes=next_nodes,
+                    edges=next_edges,
+                )
+
+                discovered_paths.append(
+                    stored_path
+                )
+
+                # Continue traversal only if hop limit
+                # has not been reached.
+                if depth + 1 < max_hops:
+
+                    queue.append(
+                        (
+                            next_node,
+                            depth + 1,
+                            next_nodes,
+                            next_edges,
+                        )
+                    )
+
+        # Deterministic path ordering.
+        discovered_paths.sort(
+            key=lambda path: path.path_id
+        )
+
+        self._paths = {
+            path.path_id: path
+            for path in discovered_paths
+        }
+
+        return self._result(
+            paths=discovered_paths,
+            traversal_metadata={
+                "operation": f"trace_{direction}",
+                "source": source_node,
+                "max_hops": max_hops,
+                "visited_nodes": len(
+                    visited_nodes
+                ),
+                "visited_edges": len(
+                    visited_edges
+                ),
+                "path_count": len(
+                    discovered_paths
+                ),
+                "truncated": any(
+                    len(path.edges) >= max_hops
+                    for path in discovered_paths
+                ),
+            },
+        )
+
+    # ========================================================
+    # FIND EXACT PATHS
+    # ========================================================
+
+    def find_paths(
+        self,
+        source: str | tuple[str, str],
+        destination: str | tuple[str, str],
+        max_hops: Optional[int] = None,
+        filters: Optional[TraceFilters] = None,
+    ) -> dict[str, Any]:
+
+        if max_hops is None:
+            max_hops = self.default_max_hops
+
+        if max_hops < 0:
+            raise ValueError(
+                "max_hops must be >= 0"
+            )
+
+        filters = filters or TraceFilters()
+
+        src = self._resolve_node(source)
+        dst = self._resolve_node(destination)
+
+        if (
+            src not in self.graph
+            or dst not in self.graph
+        ):
+
+            return self._result(
+                paths=[],
+                traversal_metadata={
+                    "operation": "find_paths",
+                    "source": src,
+                    "destination": dst,
+                    "max_hops": max_hops,
+                    "path_count": 0,
+                },
+            )
+
+        found: list[StoredPath] = []
+
+        # Simple paths prevent cycles.
+        #
+        # cutoff = maximum number of edges.
+        edge_paths = nx.all_simple_edge_paths(
+            self.graph,
+            src,
+            dst,
+            cutoff=max_hops,
+        )
+
+        for edge_path in edge_paths:
+
+            if not edge_path:
+
+                if src == dst:
+
+                    path = StoredPath(
+                        path_id=self._make_path_id(
+                            "path",
+                            [src],
+                            [],
+                        ),
+                        direction="path",
+                        source=src,
+                        destination=dst,
+                        nodes=[src],
+                        edges=[],
+                    )
+
+                    found.append(path)
+
+                continue
+
+            nodes = [src]
+            edges = []
+
+            valid = True
+
+            for (
+                u,
+                v,
+                edge_key,
+            ) in edge_path:
+
+                attributes = (
+                    self.graph[u][v][edge_key]
+                )
+
+                if not filters.matches(
+                    attributes
+                ):
+                    valid = False
+                    break
+
+                edges.append(
+                    self._serialize_edge(
+                        u,
+                        v,
+                        edge_key,
+                        attributes,
+                    )
+                )
+
+                nodes.append(v)
+
+            if not valid:
+                continue
+
+            path = StoredPath(
+                path_id=self._make_path_id(
+                    "path",
+                    nodes,
+                    edges,
+                ),
+                direction="path",
+                source=src,
+                destination=dst,
+                nodes=nodes,
+                edges=edges,
+            )
+
+            found.append(path)
+
+        found.sort(
+            key=lambda path: path.path_id
+        )
+
+        self._paths.update(
+            {
+                path.path_id: path
+                for path in found
+            }
+        )
+
+        return self._result(
+            paths=found,
+            traversal_metadata={
+                "operation": "find_paths",
+                "source": src,
+                "destination": dst,
+                "max_hops": max_hops,
+                "path_count": len(found),
+            },
+        )
+
+    # ========================================================
+    # GET EXACT TRANSACTION PATH
+    # ========================================================
+
+    def get_transaction_path(
+        self,
+        path_id: str,
+    ) -> dict[str, Any]:
+
+        if path_id not in self._paths:
+            raise KeyError(
+                f"Unknown path_id: {path_id}"
+            )
+
+        path = self._paths[path_id]
+
+        return {
+            "path_id": path.path_id,
+            "direction": path.direction,
+            "source": self._serialize_node(
+                path.source
+            ),
+            "destination": self._serialize_node(
+                path.destination
+            ),
+            "nodes": [
+                self._serialize_node(node)
+                for node in path.nodes
+            ],
+            "edges": path.edges,
+            "hop_count": len(path.edges),
+        }
+
+    # ========================================================
+    # GRAPH METRICS
+    # ========================================================
+
+    def graph_metrics(self) -> dict[str, Any]:
+
+        inbound_volume = defaultdict(
+            Decimal
+        )
+
+        outbound_volume = defaultdict(
+            Decimal
+        )
+
+        counterparties = defaultdict(set)
+
+        activity_frequency = Counter()
+
+        for (
+            u,
+            v,
+            edge_key,
+            attributes,
+        ) in self.graph.edges(
+            keys=True,
+            data=True,
+        ):
+
+            amount = Decimal(
+                str(attributes["amount"])
+            )
+
+            outbound_volume[u] += amount
+            inbound_volume[v] += amount
+
+            counterparties[u].add(v)
+            counterparties[v].add(u)
+
+            activity_frequency[u] += 1
+            activity_frequency[v] += 1
+
+        nodes = {}
+
+        for node in sorted(
+            self.graph.nodes
+        ):
+
+            node_id = self._node_id(node)
+
+            nodes[node_id] = {
+                "chain": node[0],
+                "address": node[1],
+
+                "in_degree":
+                    self.graph.in_degree(node),
+
+                "out_degree":
+                    self.graph.out_degree(node),
+
+                "total_inbound_volume":
+                    inbound_volume[node],
+
+                "total_outbound_volume":
+                    outbound_volume[node],
+
+                "counterparty_count":
+                    len(counterparties[node]),
+
+                "activity_frequency":
+                    activity_frequency[node],
+            }
+
+        if self.graph.number_of_nodes() > 1:
+            density = nx.density(
+                self.graph
+            )
+        else:
+            density = 0.0
+
+        if self.graph.number_of_nodes() > 0:
+            components = (
+                nx.number_weakly_connected_components(
+                    self.graph
+                )
+            )
+        else:
+            components = 0
+
+        return {
+            "node_count":
+                self.graph.number_of_nodes(),
+
+            "edge_count":
+                self.graph.number_of_edges(),
+
+            "density":
+                density,
+
+            "weakly_connected_components":
+                components,
+
+            "nodes":
+                nodes,
+        }
+
+    # ========================================================
+    # RESULT FORMAT
+    # ========================================================
+
+    def _result(
+        self,
+        paths: Iterable[StoredPath],
+        traversal_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+
+        serialized_paths = []
+
+        for path in sorted(
+            paths,
+            key=lambda p: p.path_id,
+        ):
+
+            serialized_paths.append(
+                {
+                    "path_id":
+                        path.path_id,
+
+                    "direction":
+                        path.direction,
+
+                    "source":
+                        self._serialize_node(
+                            path.source
+                        ),
+
+                    "destination":
+                        self._serialize_node(
+                            path.destination
+                        ),
+
+                    "nodes":
+                        [
+                            self._serialize_node(
+                                node
+                            )
+                            for node in path.nodes
+                        ],
+
+                    "edges":
+                        path.edges,
+
+                    "hop_count":
+                        len(path.edges),
+                }
+            )
+
+        return {
+            "nodes": [
+                self._serialize_node(node)
+                for node in sorted(
+                    self.graph.nodes
+                )
+            ],
+
+            "edges": [
+                self._serialize_edge(
+                    u,
+                    v,
+                    key,
+                    attributes,
+                )
+                for (
+                    u,
+                    v,
+                    key,
+                    attributes,
+                ) in sorted(
+                    self.graph.edges(
+                        keys=True,
+                        data=True,
+                    ),
+                    key=self._edge_sort_key,
+                )
+            ],
+
+            "paths":
+                serialized_paths,
+
+            "graph_metrics":
+                self.graph_metrics(),
+
+            "traversal_metadata":
+                traversal_metadata,
+        }
+
+    # ========================================================
+    # NODE SERIALIZATION
+    # ========================================================
+
+    @staticmethod
+    def _serialize_node(
+        node: tuple[str, str],
+    ) -> dict[str, str]:
+
+        return {
+            "chain": node[0],
+            "address": node[1],
+        }
+
+    # ========================================================
+    # EDGE SERIALIZATION
+    # ========================================================
+
+    @staticmethod
+    def _serialize_edge(
+        u: tuple[str, str],
+        v: tuple[str, str],
+        key: str,
+        attributes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+
+        timestamp = attributes["timestamp"]
+
+        if isinstance(
+            timestamp,
+            datetime,
+        ):
+            timestamp = timestamp.isoformat()
+
+        return {
+            "edge_id": key,
+
+            "from": {
+                "chain": u[0],
+                "address": u[1],
+            },
+
+            "to": {
+                "chain": v[0],
+                "address": v[1],
+            },
+
+            # Required transaction evidence.
+            "transaction_id":
+                attributes["transaction_id"],
+
+            "transaction_hash":
+                attributes["transaction_hash"],
+
+            "chain":
+                attributes["chain"],
+
+            "asset":
+                attributes["asset"],
+
+            "amount":
+                attributes["amount"],
+
+            "timestamp":
+                timestamp,
+
+            "block_number":
+                attributes["block_number"],
+
+            "hop_number":
+                attributes["hop_number"],
+        }
+
+    # ========================================================
+    # NODE RESOLUTION
+    # ========================================================
+
+    def _resolve_node(
+        self,
+        node: str | tuple[str, str],
+    ) -> tuple[str, str]:
+
+        # Explicit chain + address.
+        if isinstance(node, tuple):
+
+            if len(node) != 2:
+                raise ValueError(
+                    "Node must be (chain, address)"
+                )
+
+            return node
+
+        # Bare address.
+        #
+        # If it exists on multiple chains, force callers
+        # to specify the chain to avoid ambiguous identity.
+        matches = [
+            candidate
+            for candidate in self.graph.nodes
+            if candidate[1] == node
+        ]
+
+        if not matches:
+            return ("", node)
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Address {node!r} exists on multiple "
+                "chains. Use (chain, address)."
+            )
+
+        return matches[0]
+
+    # ========================================================
+    # DETERMINISTIC SORTING
+    # ========================================================
+
+    @staticmethod
+    def _transaction_sort_key(
+        tx: CanonicalTransfer,
+    ):
+
+        return (
+            tx.chain,
+            tx.block_number,
+            tx.timestamp,
+            tx.transaction_id,
+            tx.transaction_hash,
+            tx.from_address,
+            tx.to_address,
+            tx.asset,
+            str(tx.amount),
+            tx.hop_number,
+        )
+
+    @staticmethod
+    def _edge_sort_key(
+        edge,
+    ):
+
+        u, v, key, attributes = edge
+
+        return (
+            u,
+            v,
+            attributes["chain"],
+            attributes["block_number"],
+            attributes["timestamp"],
+            attributes["transaction_id"],
+            attributes["transaction_hash"],
+            attributes["asset"],
+            str(attributes["amount"]),
+            key,
+        )
+
+    # ========================================================
+    # STABLE EDGE ID
+    # ========================================================
+
+    @staticmethod
+    def _edge_key(
+        tx: CanonicalTransfer,
+    ) -> str:
+
+        return (
+            f"{tx.chain}:"
+            f"{tx.transaction_id}:"
+            f"{tx.transaction_hash}:"
+            f"{tx.asset}:"
+            f"{tx.from_address}:"
+            f"{tx.to_address}:"
+            f"{tx.block_number}"
+        )
+
+    # ========================================================
+    # STABLE PATH ID
+    # ========================================================
+
+    @staticmethod
+    def _make_path_id(
+        direction: str,
+        nodes: list[tuple[str, str]],
+        edges: list[dict[str, Any]],
+    ) -> str:
+
+        node_part = "|".join(
+            f"{chain}:{address}"
+            for chain, address in nodes
+        )
+
+        edge_part = "|".join(
+            str(edge["edge_id"])
+            for edge in edges
+        )
+
+        return (
+            f"{direction}:"
+            f"{node_part}:"
+            f"{edge_part}"
+        )
+
+
+# ============================================================
+# TESTS
+# ============================================================
+
+def make_tx(
+    transaction_id,
+    chain,
+    source,
+    destination,
+    asset="USDT",
+    amount="100",
+    timestamp=None,
+    block=1,
+):
+
+    if timestamp is None:
+        timestamp = datetime(
+            2026,
+            1,
+            1,
+        )
+
+    return CanonicalTransfer(
+        transaction_id=transaction_id,
+        transaction_hash=f"hash-{transaction_id}",
+        chain=chain,
+        from_address=source,
+        to_address=destination,
+        asset=asset,
+        amount=Decimal(amount),
+        timestamp=timestamp,
+        block_number=block,
+    )
+
+
+def addresses(result):
+
+    return [
+        [
+            node["address"]
+            for node in path["nodes"]
+        ]
+        for path in result["paths"]
+    ]
+
+
+def test_one_hop():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "tx1",
+                "ethereum",
+                "A",
+                "B",
+            )
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=1,
+    )
+
+    assert ["A", "B"] in addresses(result)
+
+    edge = result["paths"][0]["edges"][0]
+
+    assert edge["transaction_id"] == "tx1"
+    assert edge["transaction_hash"] == "hash-tx1"
+
+
+def test_multi_hop():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "B", "C"),
+            make_tx("tx3", "ethereum", "C", "D"),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=3,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "B"] in result_paths
+    assert ["A", "B", "C"] in result_paths
+    assert ["A", "B", "C", "D"] in result_paths
+
+
+def test_max_hops():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "B", "C"),
+            make_tx("tx3", "ethereum", "C", "D"),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=2,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "B", "C"] in result_paths
+    assert ["A", "B", "C", "D"] not in result_paths
+
+
+def test_branching():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "A", "C"),
+            make_tx("tx3", "ethereum", "B", "D"),
+            make_tx("tx4", "ethereum", "C", "E"),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=2,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "B"] in result_paths
+    assert ["A", "C"] in result_paths
+    assert ["A", "B", "D"] in result_paths
+    assert ["A", "C", "E"] in result_paths
+
+
+def test_cycle():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "B", "C"),
+            make_tx("tx3", "ethereum", "C", "A"),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=10,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "B"] in result_paths
+    assert ["A", "B", "C"] in result_paths
+
+    # Cycle must not be emitted as a path.
+    assert ["A", "B", "C", "A"] not in result_paths
+
+
+def test_upstream():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "B", "C"),
+            make_tx("tx3", "ethereum", "D", "A"),
+        ]
+    )
+
+    result = engine.trace_upstream(
+        ("ethereum", "C"),
+        max_hops=2,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["C", "B"] in result_paths
+    assert ["C", "B", "A"] in result_paths
+
+
+def test_disconnected_graph():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx("tx1", "ethereum", "A", "B"),
+            make_tx("tx2", "ethereum", "X", "Y"),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=5,
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "B"] in result_paths
+    assert ["A", "X"] not in result_paths
+
+
+def test_threshold_filter():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "small",
+                "ethereum",
+                "A",
+                "B",
+                amount="10",
+            ),
+            make_tx(
+                "large",
+                "ethereum",
+                "A",
+                "C",
+                amount="100",
+            ),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=1,
+        filters=TraceFilters(
+            min_value=Decimal("50")
+        ),
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "C"] in result_paths
+    assert ["A", "B"] not in result_paths
+
+
+def test_multiple_assets():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "tx1",
+                "ethereum",
+                "A",
+                "B",
+                asset="USDT",
+            ),
+            make_tx(
+                "tx2",
+                "ethereum",
+                "A",
+                "C",
+                asset="USDC",
+            ),
+            make_tx(
+                "tx3",
+                "ethereum",
+                "A",
+                "D",
+                asset="ETH",
+            ),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=1,
+        filters=TraceFilters(
+            assets=frozenset({"USDC"})
+        ),
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "C"] in result_paths
+    assert ["A", "B"] not in result_paths
+    assert ["A", "D"] not in result_paths
+
+
+def test_time_filter():
+
+    t1 = datetime(2026, 1, 1)
+    t2 = datetime(2026, 1, 2)
+    t3 = datetime(2026, 1, 3)
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "old",
+                "ethereum",
+                "A",
+                "B",
+                timestamp=t1,
+            ),
+            make_tx(
+                "inside",
+                "ethereum",
+                "A",
+                "C",
+                timestamp=t2,
+            ),
+            make_tx(
+                "new",
+                "ethereum",
+                "A",
+                "D",
+                timestamp=t3,
+            ),
+        ]
+    )
+
+    result = engine.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=1,
+        filters=TraceFilters(
+            start_time=t2,
+            end_time=t2,
+        ),
+    )
+
+    result_paths = addresses(result)
+
+    assert ["A", "C"] in result_paths
+    assert ["A", "B"] not in result_paths
+    assert ["A", "D"] not in result_paths
+
+
+def test_multiple_chains():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "eth1",
+                "ethereum",
+                "A",
+                "B",
+            ),
+            make_tx(
+                "btc1",
+                "bitcoin",
+                "A",
+                "C",
+            ),
+        ]
+    )
+
+    assert ("ethereum", "A") in engine.graph
+    assert ("bitcoin", "A") in engine.graph
+
+    assert engine.graph.number_of_nodes() == 4
+
+
+def test_same_address_same_chain_is_one_node():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "tx1",
+                "ethereum",
+                "A",
+                "B",
+            ),
+            make_tx(
+                "tx2",
+                "ethereum",
+                "C",
+                "A",
+            ),
+            make_tx(
+                "tx3",
+                "ethereum",
+                "A",
+                "D",
+            ),
+        ]
+    )
+
+    assert ("ethereum", "A") in engine.graph
+
+    assert engine.graph.number_of_nodes() == 4
+
+
+def test_exact_transaction_reconstruction():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "tx1",
+                "ethereum",
+                "A",
+                "B",
+            ),
+            make_tx(
+                "tx2",
+                "ethereum",
+                "B",
+                "C",
+            ),
+        ]
+    )
+
+    result = engine.find_paths(
+        ("ethereum", "A"),
+        ("ethereum", "C"),
+        max_hops=2,
+    )
+
+    assert len(result["paths"]) == 1
+
+    path_id = result["paths"][0]["path_id"]
+
+    evidence = engine.get_transaction_path(
+        path_id
+    )
+
+    assert evidence["hop_count"] == 2
+
+    assert [
+        edge["transaction_id"]
+        for edge in evidence["edges"]
+    ] == [
+        "tx1",
+        "tx2",
+    ]
+
+    assert [
+        edge["transaction_hash"]
+        for edge in evidence["edges"]
+    ] == [
+        "hash-tx1",
+        "hash-tx2",
+    ]
+
+
+def test_graph_metrics():
+
+    engine = CryptoTraceEngine()
+
+    engine.build_graph(
+        [
+            make_tx(
+                "tx1",
+                "ethereum",
+                "A",
+                "B",
+                amount="10",
+            ),
+            make_tx(
+                "tx2",
+                "ethereum",
+                "A",
+                "C",
+                amount="20",
+            ),
+            make_tx(
+                "tx3",
+                "ethereum",
+                "B",
+                "C",
+                amount="5",
+            ),
+        ]
+    )
+
+    metrics = engine.graph_metrics()
+
+    a = metrics["nodes"]["ethereum:A"]
+
+    b = metrics["nodes"]["ethereum:B"]
+
+    assert a["out_degree"] == 2
+    assert a["in_degree"] == 0
+
+    assert (
+        a["total_outbound_volume"]
+        == Decimal("30")
+    )
+
+    assert (
+        b["total_inbound_volume"]
+        == Decimal("10")
+    )
+
+    assert a["counterparty_count"] == 2
+
+
+def test_deterministic_results():
+
+    transactions1 = [
+        make_tx(
+            "tx2",
+            "ethereum",
+            "B",
+            "C",
+        ),
+        make_tx(
+            "tx1",
+            "ethereum",
+            "A",
+            "B",
+        ),
+    ]
+
+    transactions2 = list(
+        reversed(transactions1)
+    )
+
+    engine1 = CryptoTraceEngine()
+    engine2 = CryptoTraceEngine()
+
+    engine1.build_graph(transactions1)
+    engine2.build_graph(transactions2)
+
+    result1 = engine1.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=2,
+    )
+
+    result2 = engine2.trace_downstream(
+        ("ethereum", "A"),
+        max_hops=2,
+    )
+
+    assert result1["nodes"] == result2["nodes"]
+    assert result1["edges"] == result2["edges"]
+    assert result1["paths"] == result2["paths"]
+
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+
+if __name__ == "__main__":
+
+    transactions = [
+        {
+            "transaction_id": "tx-001",
+            "transaction_hash": "0xabc001",
+            "chain": "ethereum",
+            "from_address": "0xA",
+            "to_address": "0xB",
+            "asset": "USDT",
+            "amount": "1000",
+            "timestamp": "2026-01-01T10:00:00+00:00",
+            "block_number": 100,
+            "hop_number": 0,
+        },
+        {
+            "transaction_id": "tx-002",
+            "transaction_hash": "0xabc002",
+            "chain": "ethereum",
+            "from_address": "0xB",
+            "to_address": "0xC",
+            "asset": "USDT",
+            "amount": "750",
+            "timestamp": "2026-01-02T10:00:00+00:00",
+            "block_number": 200,
+            "hop_number": 1,
+        },
+        {
+            "transaction_id": "tx-003",
+            "transaction_hash": "0xabc003",
+            "chain": "ethereum",
+            "from_address": "0xC",
+            "to_address": "0xD",
+            "asset": "USDT",
+            "amount": "500",
+            "timestamp": "2026-01-03T10:00:00+00:00",
+            "block_number": 300,
+            "hop_number": 2,
+        },
+    ]
+
+    engine = CryptoTraceEngine(
+        default_max_hops=5
+    )
+
+    # Build graph.
+    graph = engine.build_graph(
+        transactions
+    )
+
+    # Downstream trace.
+    downstream = engine.trace_downstream(
+        ("ethereum", "0xA"),
+        max_hops=3,
+        filters=TraceFilters(
+            min_value=Decimal("500"),
+            assets=frozenset({"USDT"}),
+        ),
+    )
+
+    print("\n=== DOWNSTREAM ===")
+    print(downstream)
+
+    # Upstream trace.
+    upstream = engine.trace_upstream(
+        ("ethereum", "0xD"),
+        max_hops=3,
+    )
+
+    print("\n=== UPSTREAM ===")
+    print(upstream)
+
+    # Find exact source -> destination paths.
+    paths = engine.find_paths(
+        ("ethereum", "0xA"),
+        ("ethereum", "0xD"),
+        max_hops=3,
+    )
+
+    print("\n=== PATHS ===")
+    print(paths)
+
+    if paths["paths"]:
+
+        path_id = paths["paths"][0]["path_id"]
+
+        evidence = engine.get_transaction_path(
+            path_id
+        )
+
+        print("\n=== TRANSACTION EVIDENCE ===")
+        print(evidence)
+
+    # Graph-level metrics.
+    metrics = engine.graph_metrics()
+
+    print("\n=== GRAPH METRICS ===")
+    print(metrics)
