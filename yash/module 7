@@ -1,0 +1,1839 @@
+"""
+CryptoTrace Behavioral Wallet Clustering Engine
+================================================
+
+Deterministic, explainable behavioral clustering for blockchain addresses.
+
+Dependencies:
+    pip install networkx pytest
+
+Design:
+    - Input: canonical transactions and/or NetworkX investigation graph
+    - Node: blockchain address
+    - Edge: canonical asset transfer
+    - Extracts observable behavioral features
+    - Computes deterministic pairwise behavioral similarity
+    - Builds a similarity graph
+    - Uses connected components as behavioral clusters
+    - Produces explainable evidence for every cluster
+    - Stores results against an investigation
+    - Does NOT infer ownership, identity, control, or criminality
+    - Does NOT modify transaction facts or raw transaction data
+
+Expected canonical transaction fields are flexible. The implementation
+recognizes common aliases such as:
+
+    transaction_hash / tx_hash / hash
+    from / sender / from_address
+    to / recipient / to_address
+    value / amount / transfer_value
+    timestamp / block_timestamp / time
+    asset / token / symbol
+
+For graph input, edge attributes are read using the same aliases.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from collections import defaultdict
+from copy import deepcopy
+from math import sqrt
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import networkx as nx
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass(frozen=True)
+class WalletClusteringConfig:
+    """
+    Configuration for deterministic behavioral clustering.
+    """
+
+    # Minimum similarity required for two wallets to be connected.
+    similarity_threshold: float = 0.72
+
+    # Minimum number of shared behavioral dimensions required before
+    # two wallets can be connected.
+    min_matching_features: int = 3
+
+    # Feature comparison tolerance.
+    # Used for normalized continuous features.
+    feature_tolerance: float = 0.20
+
+    # Transaction-time window used for temporal similarity.
+    temporal_window_seconds: int = 86400 * 30
+
+    # Whether transaction asset type should be considered.
+    include_asset_behavior: bool = True
+
+    # Maximum number of counterparties retained in evidence.
+    max_evidence_items: int = 10
+
+    # Confidence scaling.
+    confidence_floor: float = 0.0
+    confidence_ceiling: float = 100.0
+
+
+# ============================================================================
+# Utility helpers
+# ============================================================================
+
+_MISSING = object()
+
+
+def _first(mapping: Mapping[str, Any], keys: Sequence[str], default=None):
+    """
+    Return the first non-null value for a set of aliases.
+    """
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _timestamp_to_seconds(value: Any) -> Optional[float]:
+    """
+    Convert common timestamp representations into epoch seconds.
+
+    Supports:
+        int / float
+        datetime
+        ISO datetime strings
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.timestamp()
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        text = value.strip()
+
+        try:
+            return float(text)
+        except ValueError:
+            pass
+
+        try:
+            normalized = text.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp()
+        except ValueError:
+            return None
+
+    return None
+
+
+def _get_address_from_edge(
+    source: Any,
+    target: Any,
+    data: Mapping[str, Any],
+) -> Tuple[str, str]:
+    """
+    Resolve sender/recipient while preserving graph semantics.
+
+    Graph source/target are authoritative if explicit address fields
+    are absent.
+    """
+    sender = _first(
+        data,
+        [
+            "from",
+            "sender",
+            "from_address",
+            "sender_address",
+            "source_address",
+        ],
+        source,
+    )
+
+    recipient = _first(
+        data,
+        [
+            "to",
+            "recipient",
+            "to_address",
+            "recipient_address",
+            "target_address",
+        ],
+        target,
+    )
+
+    return str(sender), str(recipient)
+
+
+def _extract_edge_records(
+    graph: nx.Graph,
+) -> Iterable[Tuple[str, str, Dict[str, Any]]]:
+    """
+    Yield normalized edge records without mutating the graph.
+
+    Supports:
+        DiGraph
+        MultiDiGraph
+        Graph
+        MultiGraph
+
+    Direction matters for behavioral features, so undirected graphs are
+    interpreted using their stored source/target orientation.
+    """
+
+    if graph.is_multigraph():
+        for source, target, _key, data in graph.edges(
+            keys=True,
+            data=True,
+        ):
+            yield str(source), str(target), dict(data)
+    else:
+        for source, target, data in graph.edges(data=True):
+            yield str(source), str(target), dict(data)
+
+
+def _transactions_to_graph(
+    transactions: Iterable[Mapping[str, Any]],
+) -> nx.MultiDiGraph:
+    """
+    Convert canonical transactions into a new investigation graph.
+
+    IMPORTANT:
+        The supplied transaction dictionaries are never modified.
+        A new graph is created.
+    """
+
+    graph = nx.MultiDiGraph()
+
+    for tx in transactions:
+        tx_copy = dict(tx)
+
+        sender = _first(
+            tx_copy,
+            [
+                "from",
+                "sender",
+                "from_address",
+                "sender_address",
+            ],
+        )
+
+        recipient = _first(
+            tx_copy,
+            [
+                "to",
+                "recipient",
+                "to_address",
+                "recipient_address",
+            ],
+        )
+
+        if sender is None or recipient is None:
+            continue
+
+        sender = str(sender)
+        recipient = str(recipient)
+
+        tx_hash = _first(
+            tx_copy,
+            [
+                "transaction_hash",
+                "tx_hash",
+                "hash",
+                "transaction_id",
+                "id",
+            ],
+        )
+
+        key = str(tx_hash) if tx_hash is not None else None
+
+        if key is None:
+            graph.add_edge(
+                sender,
+                recipient,
+                **tx_copy,
+            )
+        else:
+            graph.add_edge(
+                sender,
+                recipient,
+                key=key,
+                **tx_copy,
+            )
+
+    return graph
+
+
+# ============================================================================
+# Wallet behavioral accumulator
+# ============================================================================
+
+@dataclass
+class _WalletAccumulator:
+    address: str
+
+    transaction_count: int = 0
+
+    inbound_volume: float = 0.0
+    outbound_volume: float = 0.0
+
+    inbound_count: int = 0
+    outbound_count: int = 0
+
+    counterparties: set = field(default_factory=set)
+    inbound_counterparties: set = field(default_factory=set)
+    outbound_counterparties: set = field(default_factory=set)
+
+    transfer_values: List[float] = field(default_factory=list)
+
+    timestamps: List[float] = field(default_factory=list)
+
+    # Number of outbound transfers that occur shortly after
+    # an inbound transfer.
+    forwarding_count: int = 0
+
+    # Used for simple consolidation/splitting behavior.
+    inbound_event_counterparty_counts: Dict[float, int] = field(
+        default_factory=dict
+    )
+    outbound_event_counterparty_counts: Dict[float, int] = field(
+        default_factory=dict
+    )
+
+    assets: set = field(default_factory=set)
+
+    def add_transaction(
+        self,
+        *,
+        inbound: bool,
+        counterparty: str,
+        value: float,
+        timestamp: Optional[float],
+        asset: Optional[str],
+    ):
+        self.transaction_count += 1
+
+        value = max(0.0, value)
+        self.transfer_values.append(value)
+
+        if timestamp is not None:
+            self.timestamps.append(timestamp)
+
+        self.counterparties.add(counterparty)
+
+        if asset:
+            self.assets.add(str(asset))
+
+        if inbound:
+            self.inbound_count += 1
+            self.inbound_volume += value
+            self.inbound_counterparties.add(counterparty)
+        else:
+            self.outbound_count += 1
+            self.outbound_volume += value
+            self.outbound_counterparties.add(counterparty)
+
+    def finalize(self) -> Dict[str, Any]:
+        count = self.transaction_count
+
+        avg_value = (
+            sum(self.transfer_values) / len(self.transfer_values)
+            if self.transfer_values
+            else 0.0
+        )
+
+        total_volume = self.inbound_volume + self.outbound_volume
+
+        if self.outbound_count == 0:
+            inbound_outbound_ratio = (
+                float("inf") if self.inbound_count else 0.0
+            )
+        else:
+            inbound_outbound_ratio = (
+                self.inbound_count / self.outbound_count
+            )
+
+        if len(self.timestamps) >= 2:
+            ordered = sorted(self.timestamps)
+
+            intervals = [
+                ordered[i] - ordered[i - 1]
+                for i in range(1, len(ordered))
+                if ordered[i] >= ordered[i - 1]
+            ]
+
+            avg_interval = (
+                sum(intervals) / len(intervals)
+                if intervals
+                else 0.0
+            )
+
+            duration = max(ordered[-1] - ordered[0], 1.0)
+
+            transaction_frequency = (
+                max(count - 1, 0) / duration
+            )
+
+            temporal_activity = {
+                "first_timestamp": ordered[0],
+                "last_timestamp": ordered[-1],
+                "active_duration_seconds": duration,
+                "average_inter_transaction_seconds": avg_interval,
+                "transaction_frequency_per_second": transaction_frequency,
+            }
+        elif len(self.timestamps) == 1:
+            temporal_activity = {
+                "first_timestamp": self.timestamps[0],
+                "last_timestamp": self.timestamps[0],
+                "active_duration_seconds": 0.0,
+                "average_inter_transaction_seconds": 0.0,
+                "transaction_frequency_per_second": 0.0,
+            }
+        else:
+            temporal_activity = {
+                "first_timestamp": None,
+                "last_timestamp": None,
+                "active_duration_seconds": 0.0,
+                "average_inter_transaction_seconds": 0.0,
+                "transaction_frequency_per_second": 0.0,
+            }
+
+        # Consolidation:
+        # Multiple inbound counterparties followed by relatively few
+        # outbound transactions.
+        consolidation_behavior = (
+            self.inbound_count > self.outbound_count
+            and len(self.inbound_counterparties) >= 2
+        )
+
+        # Splitting:
+        # Few inbound counterparties followed by multiple outbound
+        # counterparties.
+        splitting_behavior = (
+            self.outbound_count > self.inbound_count
+            and len(self.outbound_counterparties) >= 2
+        )
+
+        forwarding_frequency = (
+            self.forwarding_count / self.inbound_count
+            if self.inbound_count
+            else 0.0
+        )
+
+        return {
+            "transaction_count": count,
+            "inbound_volume": self.inbound_volume,
+            "outbound_volume": self.outbound_volume,
+            "unique_counterparties": len(self.counterparties),
+            "inbound_outbound_ratio": inbound_outbound_ratio,
+            "transaction_frequency": temporal_activity[
+                "transaction_frequency_per_second"
+            ],
+            "average_transfer_value": avg_value,
+            "forwarding_frequency": forwarding_frequency,
+            "consolidation_behavior": consolidation_behavior,
+            "splitting_behavior": splitting_behavior,
+            "temporal_activity": temporal_activity,
+            "counterparty_overlap": {
+                "inbound_counterparties": sorted(
+                    self.inbound_counterparties
+                ),
+                "outbound_counterparties": sorted(
+                    self.outbound_counterparties
+                ),
+                "all_counterparties": sorted(
+                    self.counterparties
+                ),
+            },
+            "asset_behavior": sorted(self.assets),
+            "total_volume": total_volume,
+        }
+
+
+# ============================================================================
+# Behavioral feature extraction
+# ============================================================================
+
+class WalletBehaviorFeatureExtractor:
+    """
+    Extract deterministic behavioral features from an investigation graph.
+    """
+
+    def __init__(self, config: WalletClusteringConfig):
+        self.config = config
+
+    def extract(
+        self,
+        graph: nx.Graph,
+    ) -> Dict[str, Dict[str, Any]]:
+        accumulators: Dict[str, _WalletAccumulator] = {}
+
+        def accumulator(address: str) -> _WalletAccumulator:
+            if address not in accumulators:
+                accumulators[address] = _WalletAccumulator(address)
+            return accumulators[address]
+
+        edges = list(_extract_edge_records(graph))
+
+        # First pass: transaction behavior.
+        for source, target, data in edges:
+            sender, recipient = _get_address_from_edge(
+                source,
+                target,
+                data,
+            )
+
+            value = _safe_float(
+                _first(
+                    data,
+                    [
+                        "value",
+                        "amount",
+                        "transfer_value",
+                        "asset_value",
+                    ],
+                    0.0,
+                )
+            )
+
+            timestamp = _timestamp_to_seconds(
+                _first(
+                    data,
+                    [
+                        "timestamp",
+                        "block_timestamp",
+                        "time",
+                        "datetime",
+                    ],
+                )
+            )
+
+            asset = _first(
+                data,
+                [
+                    "asset",
+                    "token",
+                    "symbol",
+                    "asset_id",
+                    "token_symbol",
+                ],
+            )
+
+            sender_acc = accumulator(sender)
+            recipient_acc = accumulator(recipient)
+
+            sender_acc.add_transaction(
+                inbound=False,
+                counterparty=recipient,
+                value=value,
+                timestamp=timestamp,
+                asset=asset,
+            )
+
+            recipient_acc.add_transaction(
+                inbound=True,
+                counterparty=sender,
+                value=value,
+                timestamp=timestamp,
+                asset=asset,
+            )
+
+        # Second pass: forwarding behavior.
+        #
+        # An outbound transaction is considered a forwarding event when
+        # it occurs within the configured temporal window after an
+        # inbound transaction to the same wallet.
+        #
+        # This is deliberately heuristic and observable; it does not
+        # assert that the outbound transaction is funded by the inbound
+        # transaction.
+        inbound_times: Dict[str, List[float]] = defaultdict(list)
+        outbound_times: Dict[str, List[float]] = defaultdict(list)
+
+        for source, target, data in edges:
+            sender, recipient = _get_address_from_edge(
+                source,
+                target,
+                data,
+            )
+
+            timestamp = _timestamp_to_seconds(
+                _first(
+                    data,
+                    [
+                        "timestamp",
+                        "block_timestamp",
+                        "time",
+                        "datetime",
+                    ],
+                )
+            )
+
+            if timestamp is None:
+                continue
+
+            inbound_times[recipient].append(timestamp)
+            outbound_times[sender].append(timestamp)
+
+        for address, outbound_list in outbound_times.items():
+            incoming = sorted(inbound_times.get(address, []))
+
+            if not incoming:
+                continue
+
+            forwarding_count = 0
+
+            for outbound_timestamp in outbound_list:
+                has_recent_inbound = any(
+                    0 <= outbound_timestamp - inbound_timestamp
+                    <= self.config.temporal_window_seconds
+                    for inbound_timestamp in incoming
+                )
+
+                if has_recent_inbound:
+                    forwarding_count += 1
+
+            if address in accumulators:
+                accumulators[address].forwarding_count = forwarding_count
+
+        return {
+            address: acc.finalize()
+            for address, acc in sorted(
+                accumulators.items(),
+                key=lambda item: item[0],
+            )
+        }
+
+
+# ============================================================================
+# Feature vector construction
+# ============================================================================
+
+class BehavioralVectorizer:
+    """
+    Converts raw behavioral features into deterministic normalized vectors.
+
+    Normalization is based on the complete investigation population.
+    This avoids hard-coded blockchain-specific value scales.
+    """
+
+    CONTINUOUS_FEATURES = (
+        "transaction_count",
+        "inbound_volume",
+        "outbound_volume",
+        "unique_counterparties",
+        "inbound_outbound_ratio",
+        "transaction_frequency",
+        "average_transfer_value",
+        "forwarding_frequency",
+    )
+
+    BOOLEAN_FEATURES = (
+        "consolidation_behavior",
+        "splitting_behavior",
+    )
+
+    def vectorize(
+        self,
+        features: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, float]]:
+        addresses = sorted(features)
+
+        result = {
+            address: {}
+            for address in addresses
+        }
+
+        for feature_name in self.CONTINUOUS_FEATURES:
+            values = []
+
+            for address in addresses:
+                value = features[address].get(
+                    feature_name,
+                    0.0,
+                )
+
+                if value == float("inf"):
+                    # Cap infinite inbound/outbound ratio using
+                    # population max among finite values later.
+                    continue
+
+                values.append(_safe_float(value))
+
+            finite_max = max(values) if values else 0.0
+            finite_min = min(values) if values else 0.0
+
+            # Use log scaling for highly skewed blockchain quantities.
+            transformed = {}
+
+            for address in addresses:
+                raw = features[address].get(
+                    feature_name,
+                    0.0,
+                )
+
+                if raw == float("inf"):
+                    transformed[address] = (
+                        sqrt(finite_max + 1.0)
+                        if finite_max > 0
+                        else 1.0
+                    )
+                else:
+                    transformed[address] = sqrt(
+                        max(_safe_float(raw), 0.0)
+                    )
+
+            t_values = list(transformed.values())
+
+            t_min = min(t_values) if t_values else 0.0
+            t_max = max(t_values) if t_values else 0.0
+
+            for address in addresses:
+                value = transformed[address]
+
+                if t_max == t_min:
+                    normalized = 0.0 if t_max == 0 else 1.0
+                else:
+                    normalized = (
+                        (value - t_min)
+                        / (t_max - t_min)
+                    )
+
+                result[address][feature_name] = normalized
+
+        for feature_name in self.BOOLEAN_FEATURES:
+            for address in addresses:
+                result[address][feature_name] = (
+                    1.0
+                    if features[address].get(
+                        feature_name,
+                        False,
+                    )
+                    else 0.0
+                )
+
+        return result
+
+
+# ============================================================================
+# Similarity engine
+# ============================================================================
+
+@dataclass(frozen=True)
+class SimilarityResult:
+    address_a: str
+    address_b: str
+    similarity: float
+    matching_features: Tuple[str, ...]
+    evidence: Tuple[Dict[str, Any], ...]
+
+
+class BehavioralSimilarityEngine:
+    """
+    Deterministic explainable similarity.
+
+    Similarity is the cosine similarity between normalized behavioral
+    feature vectors.
+
+    Additional explainability requires a minimum number of dimensions
+    to be close to one another.
+    """
+
+    FEATURE_WEIGHTS = {
+        "transaction_count": 1.0,
+        "inbound_volume": 1.0,
+        "outbound_volume": 1.0,
+        "unique_counterparties": 1.0,
+        "inbound_outbound_ratio": 1.0,
+        "transaction_frequency": 1.0,
+        "average_transfer_value": 1.0,
+        "forwarding_frequency": 1.0,
+        "consolidation_behavior": 1.0,
+        "splitting_behavior": 1.0,
+    }
+
+    def __init__(self, config: WalletClusteringConfig):
+        self.config = config
+
+    def compare(
+        self,
+        address_a: str,
+        address_b: str,
+        vector_a: Mapping[str, float],
+        vector_b: Mapping[str, float],
+        raw_a: Mapping[str, Any],
+        raw_b: Mapping[str, Any],
+    ) -> SimilarityResult:
+
+        feature_names = sorted(
+            set(vector_a.keys()) | set(vector_b.keys())
+        )
+
+        weighted_a = []
+        weighted_b = []
+
+        matching = []
+        evidence = []
+
+        for feature in feature_names:
+            a = _safe_float(vector_a.get(feature, 0.0))
+            b = _safe_float(vector_b.get(feature, 0.0))
+
+            weight = self.FEATURE_WEIGHTS.get(
+                feature,
+                1.0,
+            )
+
+            weighted_a.append(a * weight)
+            weighted_b.append(b * weight)
+
+            difference = abs(a - b)
+
+            if difference <= self.config.feature_tolerance:
+                matching.append(feature)
+
+            evidence.append(
+                {
+                    "feature": feature,
+                    "wallet_a_value": raw_a.get(feature),
+                    "wallet_b_value": raw_b.get(feature),
+                    "normalized_a": round(a, 6),
+                    "normalized_b": round(b, 6),
+                    "absolute_normalized_difference": round(
+                        difference,
+                        6,
+                    ),
+                    "matches_behaviorally": (
+                        difference
+                        <= self.config.feature_tolerance
+                    ),
+                }
+            )
+
+        similarity = self._cosine_similarity(
+            weighted_a,
+            weighted_b,
+        )
+
+        return SimilarityResult(
+            address_a=address_a,
+            address_b=address_b,
+            similarity=similarity,
+            matching_features=tuple(sorted(matching)),
+            evidence=tuple(evidence),
+        )
+
+    @staticmethod
+    def _cosine_similarity(
+        a: Sequence[float],
+        b: Sequence[float],
+    ) -> float:
+        if not a or not b:
+            return 0.0
+
+        dot = sum(x * y for x, y in zip(a, b))
+
+        magnitude_a = sqrt(
+            sum(x * x for x in a)
+        )
+
+        magnitude_b = sqrt(
+            sum(y * y for y in b)
+        )
+
+        if magnitude_a == 0.0 or magnitude_b == 0.0:
+            return 0.0
+
+        similarity = dot / (
+            magnitude_a * magnitude_b
+        )
+
+        # Numerical safety.
+        return max(
+            0.0,
+            min(1.0, similarity),
+        )
+
+
+# ============================================================================
+# Result repository
+# ============================================================================
+
+class InMemoryWalletClusterRepository:
+    """
+    Investigation-scoped result store.
+
+    Replace this with a database-backed repository in production.
+
+    Raw transactions and transaction facts are never stored or modified
+    by this repository.
+    """
+
+    def __init__(self):
+        self._results: Dict[str, Dict[str, Any]] = {}
+
+    def save(
+        self,
+        investigation_id: str,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Deep-copy result to prevent accidental mutation by callers.
+        self._results[
+            str(investigation_id)
+        ] = deepcopy(result)
+
+        return deepcopy(result)
+
+    def get(
+        self,
+        investigation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        result = self._results.get(
+            str(investigation_id)
+        )
+
+        return deepcopy(result) if result else None
+
+
+# ============================================================================
+# Main service
+# ============================================================================
+
+class WalletClusteringService:
+    """
+    Main CryptoTrace behavioral wallet clustering service.
+
+    Public API:
+
+        service.cluster(investigation_graph)
+
+    or:
+
+        service.cluster(
+            investigation_graph,
+            investigation_id="INV-123",
+        )
+
+    The graph can optionally contain:
+
+        graph.graph["investigation_id"]
+
+    If canonical transactions are supplied instead, use:
+
+        service.cluster_transactions(
+            transactions,
+            investigation_id="INV-123",
+        )
+    """
+
+    ALGORITHM_VERSION = "cryptotrace-behavioral-v1"
+
+    def __init__(
+        self,
+        config: Optional[WalletClusteringConfig] = None,
+        repository: Optional[
+            InMemoryWalletClusterRepository
+        ] = None,
+    ):
+        self.config = (
+            config
+            or WalletClusteringConfig()
+        )
+
+        self.repository = (
+            repository
+            or InMemoryWalletClusterRepository()
+        )
+
+        self.extractor = (
+            WalletBehaviorFeatureExtractor(
+                self.config
+            )
+        )
+
+        self.vectorizer = BehavioralVectorizer()
+
+        self.similarity_engine = (
+            BehavioralSimilarityEngine(
+                self.config
+            )
+        )
+
+    # ---------------------------------------------------------------------
+    # Required API
+    # ---------------------------------------------------------------------
+
+    def cluster(
+        self,
+        investigation_graph: nx.Graph,
+        investigation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Cluster wallets from an investigation graph.
+
+        Does not mutate the graph.
+        """
+
+        if not isinstance(
+            investigation_graph,
+            nx.Graph,
+        ):
+            raise TypeError(
+                "investigation_graph must be a NetworkX graph"
+            )
+
+        investigation_id = (
+            investigation_id
+            or investigation_graph.graph.get(
+                "investigation_id"
+            )
+            or "unknown-investigation"
+        )
+
+        # Extract features without modifying graph.
+        features = self.extractor.extract(
+            investigation_graph
+        )
+
+        vectors = self.vectorizer.vectorize(
+            features
+        )
+
+        addresses = sorted(features)
+
+        similarity_graph = nx.Graph()
+
+        similarity_graph.add_nodes_from(
+            addresses
+        )
+
+        pairwise_results: Dict[
+            Tuple[str, str],
+            SimilarityResult,
+        ] = {}
+
+        # Deterministic pair iteration.
+        for index, address_a in enumerate(addresses):
+            for address_b in addresses[index + 1:]:
+                comparison = (
+                    self.similarity_engine.compare(
+                        address_a,
+                        address_b,
+                        vectors[address_a],
+                        vectors[address_b],
+                        features[address_a],
+                        features[address_b],
+                    )
+                )
+
+                pairwise_results[
+                    (address_a, address_b)
+                ] = comparison
+
+                if (
+                    comparison.similarity
+                    >= self.config.similarity_threshold
+                    and len(
+                        comparison.matching_features
+                    )
+                    >= self.config.min_matching_features
+                ):
+                    similarity_graph.add_edge(
+                        address_a,
+                        address_b,
+                        similarity=round(
+                            comparison.similarity,
+                            6,
+                        ),
+                    )
+
+        # Connected components create deterministic clusters.
+        components = list(
+            nx.connected_components(
+                similarity_graph
+            )
+        )
+
+        components = [
+            sorted(component)
+            for component in components
+            if len(component) > 1
+        ]
+
+        # Stable ordering.
+        components.sort(
+            key=lambda members: (
+                members[0],
+                len(members),
+            )
+        )
+
+        clusters = []
+
+        for cluster_number, members in enumerate(
+            components,
+            start=1,
+        ):
+            cluster_id = (
+                f"{investigation_id}:behavioral:{cluster_number:04d}"
+            )
+
+            cluster_similarity_evidence = []
+
+            pair_similarities = []
+
+            for index, address_a in enumerate(
+                members
+            ):
+                for address_b in members[index + 1:]:
+                    key = (
+                        address_a,
+                        address_b,
+                    )
+
+                    comparison = (
+                        pairwise_results.get(key)
+                    )
+
+                    if comparison is None:
+                        key = (
+                            address_b,
+                            address_a,
+                        )
+                        comparison = (
+                            pairwise_results.get(key)
+                        )
+
+                    if comparison is None:
+                        continue
+
+                    pair_similarities.append(
+                        comparison.similarity
+                    )
+
+                    cluster_similarity_evidence.append(
+                        {
+                            "wallet_a": address_a,
+                            "wallet_b": address_b,
+                            "similarity_score": round(
+                                comparison.similarity,
+                                6,
+                            ),
+                            "matching_features": list(
+                                comparison.matching_features
+                            ),
+                            "feature_evidence": list(
+                                comparison.evidence
+                            ),
+                        }
+                    )
+
+            confidence = (
+                self._cluster_confidence(
+                    members,
+                    pair_similarities,
+                )
+            )
+
+            clusters.append(
+                {
+                    "cluster_id": cluster_id,
+                    "member_addresses": members,
+                    "features": {
+                        address: deepcopy(
+                            features[address]
+                        )
+                        for address in members
+                    },
+                    "similarity_evidence": (
+                        cluster_similarity_evidence
+                    ),
+                    "cluster_confidence": confidence,
+                    "confidence_semantics": (
+                        "behavioral similarity only; "
+                        "not identity, ownership, control, "
+                        "or criminal attribution"
+                    ),
+                }
+            )
+
+        result = {
+            "investigation_id": str(
+                investigation_id
+            ),
+            "algorithm": self.ALGORITHM_VERSION,
+            "configuration": {
+                "similarity_threshold": (
+                    self.config.similarity_threshold
+                ),
+                "min_matching_features": (
+                    self.config.min_matching_features
+                ),
+                "feature_tolerance": (
+                    self.config.feature_tolerance
+                ),
+            },
+            "cluster_count": len(clusters),
+            "clusters": clusters,
+
+            # Directly useful to Risk Engine / Dashboard.
+            "wallet_features": {
+                address: deepcopy(
+                    features[address]
+                )
+                for address in addresses
+            },
+
+            "unclustered_addresses": [
+                address
+                for address in addresses
+                if not any(
+                    address in cluster[
+                        "member_addresses"
+                    ]
+                    for cluster in clusters
+                )
+            ],
+
+            "semantics": {
+                "purpose": (
+                    "Observable behavioral similarity"
+                ),
+                "does_not_establish": [
+                    "common human ownership",
+                    "common legal ownership",
+                    "criminal control",
+                    "identity",
+                ],
+            },
+        }
+
+        # Store only derived clustering results.
+        self.repository.save(
+            str(investigation_id),
+            result,
+        )
+
+        return result
+
+    def cluster_transactions(
+        self,
+        transactions: Iterable[
+            Mapping[str, Any]
+        ],
+        investigation_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Convenience API for canonical transactions.
+        """
+
+        transaction_list = [
+            dict(tx)
+            for tx in transactions
+        ]
+
+        graph = _transactions_to_graph(
+            transaction_list
+        )
+
+        graph.graph[
+            "investigation_id"
+        ] = str(investigation_id)
+
+        return self.cluster(
+            graph,
+            investigation_id=str(
+                investigation_id
+            ),
+        )
+
+    def get_result(
+        self,
+        investigation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        return self.repository.get(
+            investigation_id
+        )
+
+    # ---------------------------------------------------------------------
+    # Confidence
+    # ---------------------------------------------------------------------
+
+    def _cluster_confidence(
+        self,
+        members: Sequence[str],
+        pair_similarities: Sequence[float],
+    ) -> float:
+        """
+        Behavioral confidence, not ownership confidence.
+
+        Factors:
+            1. Average pair similarity
+            2. Cluster connectivity size
+
+        Output is always bounded 0-100.
+        """
+
+        if len(members) < 2:
+            return 0.0
+
+        if not pair_similarities:
+            return 0.0
+
+        avg_similarity = (
+            sum(pair_similarities)
+            / len(pair_similarities)
+        )
+
+        # Similarity is already [0, 1].
+        confidence = avg_similarity * 100.0
+
+        confidence = max(
+            self.config.confidence_floor,
+            min(
+                self.config.confidence_ceiling,
+                confidence,
+            ),
+        )
+
+        return round(
+            confidence,
+            2,
+        )
+
+
+# ============================================================================
+# Risk Engine adapter
+# ============================================================================
+
+class WalletClusterRiskAdapter:
+    """
+    Lightweight adapter demonstrating how the Risk Engine can consume
+    clustering results without needing to know clustering internals.
+    """
+
+    @staticmethod
+    def to_risk_records(
+        clustering_result: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        records = []
+
+        for cluster in clustering_result.get(
+            "clusters",
+            [],
+        ):
+            records.append(
+                {
+                    "cluster_id": cluster[
+                        "cluster_id"
+                    ],
+                    "member_addresses": list(
+                        cluster[
+                            "member_addresses"
+                        ]
+                    ),
+                    "behavioral_confidence": cluster[
+                        "cluster_confidence"
+                    ],
+                    "evidence": cluster[
+                        "similarity_evidence"
+                    ],
+                    "risk_semantics": (
+                        "Behavioral similarity is an "
+                        "analytical signal only."
+                    ),
+                }
+            )
+
+        return records
+
+
+# ============================================================================
+# Investigation Dashboard adapter
+# ============================================================================
+
+class WalletClusterDashboardAdapter:
+    """
+    Converts the clustering output into a dashboard-friendly structure.
+    """
+
+    @staticmethod
+    def to_dashboard(
+        clustering_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+
+        return {
+            "investigation_id": (
+                clustering_result[
+                    "investigation_id"
+                ]
+            ),
+            "summary": {
+                "cluster_count": (
+                    clustering_result[
+                        "cluster_count"
+                    ]
+                ),
+                "wallet_count": len(
+                    clustering_result[
+                        "wallet_features"
+                    ]
+                ),
+                "unclustered_count": len(
+                    clustering_result[
+                        "unclustered_addresses"
+                    ]
+                ),
+            },
+            "clusters": [
+                {
+                    "cluster_id": cluster[
+                        "cluster_id"
+                    ],
+                    "members": cluster[
+                        "member_addresses"
+                    ],
+                    "confidence": cluster[
+                        "cluster_confidence"
+                    ],
+                    "confidence_label": (
+                        WalletClusterDashboardAdapter
+                        ._confidence_label(
+                            cluster[
+                                "cluster_confidence"
+                            ]
+                        )
+                    ),
+                    "evidence": cluster[
+                        "similarity_evidence"
+                    ],
+                }
+                for cluster in clustering_result[
+                    "clusters"
+                ]
+            ],
+        }
+
+    @staticmethod
+    def _confidence_label(
+        confidence: float,
+    ) -> str:
+        if confidence >= 85:
+            return "high behavioral similarity"
+
+        if confidence >= 70:
+            return "moderate behavioral similarity"
+
+        return "low behavioral similarity"
+
+
+# ============================================================================
+# Example
+# ============================================================================
+
+if __name__ == "__main__":
+
+    transactions = [
+        {
+            "transaction_hash": "tx001",
+            "from_address": "A",
+            "to_address": "B",
+            "value": 100,
+            "asset": "ETH",
+            "timestamp": "2026-01-01T10:00:00+00:00",
+        },
+        {
+            "transaction_hash": "tx002",
+            "from_address": "C",
+            "to_address": "D",
+            "value": 100,
+            "asset": "ETH",
+            "timestamp": "2026-01-01T10:01:00+00:00",
+        },
+        {
+            "transaction_hash": "tx003",
+            "from_address": "A",
+            "to_address": "E",
+            "value": 50,
+            "asset": "ETH",
+            "timestamp": "2026-01-01T10:02:00+00:00",
+        },
+        {
+            "transaction_hash": "tx004",
+            "from_address": "C",
+            "to_address": "F",
+            "value": 50,
+            "asset": "ETH",
+            "timestamp": "2026-01-01T10:03:00+00:00",
+        },
+    ]
+
+    service = WalletClusteringService()
+
+    result = service.cluster_transactions(
+        transactions,
+        investigation_id="INV-001",
+    )
+
+    print("\n=== Behavioral Wallet Clusters ===")
+
+    for cluster in result["clusters"]:
+        print(
+            cluster["cluster_id"],
+            cluster["member_addresses"],
+            cluster["cluster_confidence"],
+        )
+
+    print("\n=== Risk Engine ===")
+
+    risk_records = (
+        WalletClusterRiskAdapter.to_risk_records(
+            result
+        )
+    )
+
+    for record in risk_records:
+        print(record)
+
+    print("\n=== Dashboard ===")
+
+    dashboard = (
+        WalletClusterDashboardAdapter.to_dashboard(
+            result
+        )
+    )
+
+    print(dashboard)
+
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+def _make_test_graph(
+    transactions: List[Dict[str, Any]],
+) -> nx.MultiDiGraph:
+
+    graph = _transactions_to_graph(
+        transactions
+    )
+
+    graph.graph[
+        "investigation_id"
+    ] = "TEST-INV"
+
+    return graph
+
+
+def test_isolated_wallets():
+    """
+    Wallets with no behavioral similarity should remain unclustered.
+    """
+
+    transactions = [
+        {
+            "transaction_hash": "a1",
+            "from": "A",
+            "to": "X",
+            "value": 10,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "b1",
+            "from": "B",
+            "to": "Y",
+            "value": 10000,
+            "timestamp": 200,
+        },
+    ]
+
+    service = WalletClusteringService(
+        WalletClusteringConfig(
+            similarity_threshold=0.95,
+            min_matching_features=5,
+        )
+    )
+
+    result = service.cluster(
+        _make_test_graph(transactions),
+        "TEST-INV",
+    )
+
+    assert result["cluster_count"] == 0
+    assert set(
+        result["unclustered_addresses"]
+    ) == {"A", "B", "X", "Y"}
+
+
+def test_strongly_connected_behavioral_patterns():
+    """
+    A and B exhibit nearly identical observable behavior.
+    """
+
+    transactions = [
+        # Wallet A
+        {
+            "transaction_hash": "a1",
+            "from": "P1",
+            "to": "A",
+            "value": 100,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "a2",
+            "from": "P2",
+            "to": "A",
+            "value": 100,
+            "timestamp": 200,
+        },
+        {
+            "transaction_hash": "a3",
+            "from": "A",
+            "to": "Q1",
+            "value": 100,
+            "timestamp": 300,
+        },
+
+        # Wallet B
+        {
+            "transaction_hash": "b1",
+            "from": "P1",
+            "to": "B",
+            "value": 100,
+            "timestamp": 110,
+        },
+        {
+            "transaction_hash": "b2",
+            "from": "P2",
+            "to": "B",
+            "value": 100,
+            "timestamp": 210,
+        },
+        {
+            "transaction_hash": "b3",
+            "from": "B",
+            "to": "Q1",
+            "value": 100,
+            "timestamp": 310,
+        },
+    ]
+
+    service = WalletClusteringService(
+        WalletClusteringConfig(
+            similarity_threshold=0.80,
+            min_matching_features=5,
+        )
+    )
+
+    result = service.cluster(
+        _make_test_graph(transactions),
+        "TEST-INV",
+    )
+
+    address_clusters = [
+        set(cluster["member_addresses"])
+        for cluster in result["clusters"]
+    ]
+
+    assert any(
+        {"A", "B"}.issubset(cluster)
+        for cluster in address_clusters
+    )
+
+
+def test_unrelated_wallets():
+    """
+    Wallets with materially different behavior should not be grouped.
+    """
+
+    transactions = [
+        {
+            "transaction_hash": "a1",
+            "from": "P1",
+            "to": "A",
+            "value": 10,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "a2",
+            "from": "A",
+            "to": "Q1",
+            "value": 10,
+            "timestamp": 200,
+        },
+
+        {
+            "transaction_hash": "b1",
+            "from": "P2",
+            "to": "B",
+            "value": 100000,
+            "timestamp": 100000,
+        },
+        {
+            "transaction_hash": "b2",
+            "from": "P3",
+            "to": "B",
+            "value": 200000,
+            "timestamp": 200000,
+        },
+        {
+            "transaction_hash": "b3",
+            "from": "P4",
+            "to": "B",
+            "value": 300000,
+            "timestamp": 300000,
+        },
+        {
+            "transaction_hash": "b4",
+            "from": "B",
+            "to": "Q2",
+            "value": 600000,
+            "timestamp": 400000,
+        },
+    ]
+
+    service = WalletClusteringService(
+        WalletClusteringConfig(
+            similarity_threshold=0.90,
+            min_matching_features=6,
+        )
+    )
+
+    result = service.cluster(
+        _make_test_graph(transactions),
+        "TEST-INV",
+    )
+
+    for cluster in result["clusters"]:
+        members = set(
+            cluster["member_addresses"]
+        )
+
+        assert not (
+            {"A", "B"}.issubset(members)
+        )
+
+
+def test_repeated_runs_are_stable():
+    """
+    Same graph + same configuration must produce exactly the same
+    clustering result.
+    """
+
+    transactions = [
+        {
+            "transaction_hash": "1",
+            "from": "A",
+            "to": "X",
+            "value": 100,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "2",
+            "from": "B",
+            "to": "Y",
+            "value": 100,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "3",
+            "from": "X",
+            "to": "Z",
+            "value": 50,
+            "timestamp": 200,
+        },
+        {
+            "transaction_hash": "4",
+            "from": "Y",
+            "to": "Z",
+            "value": 50,
+            "timestamp": 200,
+        },
+    ]
+
+    service = WalletClusteringService()
+
+    graph1 = _make_test_graph(
+        transactions
+    )
+
+    graph2 = _make_test_graph(
+        transactions
+    )
+
+    result1 = service.cluster(
+        graph1,
+        "TEST-INV",
+    )
+
+    result2 = service.cluster(
+        graph2,
+        "TEST-INV",
+    )
+
+    assert result1 == result2
+
+
+def test_cluster_confidence_bounded():
+    """
+    Confidence must always be between 0 and 100.
+    """
+
+    transactions = [
+        {
+            "transaction_hash": "1",
+            "from": "A",
+            "to": "X",
+            "value": 100,
+            "timestamp": 100,
+        },
+        {
+            "transaction_hash": "2",
+            "from": "B",
+            "to": "Y",
+            "value": 100,
+            "timestamp": 100,
+        },
+    ]
+
+    service = WalletClusteringService(
+        WalletClusteringConfig(
+            similarity_threshold=0.0,
+            min_matching_features=0,
+        )
+    )
+
+    result = service.cluster(
+        _make_test_graph(transactions),
+        "TEST-INV",
+    )
+
+    for cluster in result["clusters"]:
+        confidence = cluster[
+            "cluster_confidence"
+        ]
+
+        assert 0 <= confidence <= 100
