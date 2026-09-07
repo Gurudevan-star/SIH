@@ -1,0 +1,108 @@
+{
+  "dataset_type": "SYNTHETIC_DEMONSTRATION_DATA",
+
+  "case": {
+    "case_id": "CASE-DEMO-001",
+    "title": "CryptoTrace SIH Demonstration Case",
+    "description": "Synthetic cryptocurrency fund-flow investigation"
+  },
+
+  "source_wallet": {
+    "address": "0x1111111111111111111111111111111111111111",
+    "network": "ethereum"
+  },
+
+  "transactions": [
+    {
+      "transaction_id": "TX-DEMO-001",
+      "transaction_hash": "0xsynthetic001",
+      "from": "0x1111111111111111111111111111111111111111",
+      "to": "0x2222222222222222222222222222222222222222",
+      "asset": "USDT",
+      "amount": "5000",
+      "timestamp": "2026-09-07T10:00:00Z",
+      "hop": 1
+    },
+    {
+      "transaction_id": "TX-DEMO-002",
+      "transaction_hash": "0xsynthetic002",
+      "from": "0x2222222222222222222222222222222222222222",
+      "to": "0x3333333333333333333333333333333333333333",
+      "asset": "USDT",
+      "amount": "4800",
+      "timestamp": "2026-09-07T10:04:00Z",
+      "hop": 2
+    },
+    {
+      "transaction_id": "TX-DEMO-003",
+      "transaction_hash": "0xsynthetic003",
+      "from": "0x3333333333333333333333333333333333333333",
+      "to": "0x4444444444444444444444444444444444444444",
+      "asset": "USDT",
+      "amount": "4700",
+      "timestamp": "2026-09-07T10:08:00Z",
+      "hop": 3
+    },
+    {
+      "transaction_id": "TX-DEMO-004",
+      "transaction_hash": "0xsynthetic004",
+      "from": "0x4444444444444444444444444444444444444444",
+      "to": "0x5555555555555555555555555555555555555555",
+      "asset": "USDT",
+      "amount": "4650",
+      "timestamp": "2026-09-07T10:12:00Z",
+      "hop": 4
+    }
+  ],
+
+  "exchange_intelligence": [
+    {
+      "address": "0x5555555555555555555555555555555555555555",
+      "network": "ethereum",
+      "entity": "Demo Exchange",
+      "address_type": "DEPOSIT_ADDRESS",
+      "classification": "PROBABLE",
+      "confidence": 82,
+      "source": "SYNTHETIC_INTELLIGENCE_DATA"
+    }
+  ],
+
+  "risk_assessment": {
+    "risk_score": 87,
+    "risk_level": "HIGH",
+    "factors": [
+      {
+        "name": "High Value Movement",
+        "contribution": 25
+      },
+      {
+        "name": "Rapid Forwarding",
+        "contribution": 20
+      },
+      {
+        "name": "Multi-Hop Routing",
+        "contribution": 22
+      },
+      {
+        "name": "Exchange Intelligence Match",
+        "contribution": 20
+      }
+    ]
+  },
+
+  "attribution": {
+    "confidence": 82,
+    "classification": "PROBABLE",
+    "entity": "Demo Exchange"
+  },
+
+  "monitoring_event": {
+    "transaction_id": "TX-DEMO-005",
+    "transaction_hash": "0xsynthetic005",
+    "from": "0x5555555555555555555555555555555555555555",
+    "to": "0x6666666666666666666666666666666666666666",
+    "asset": "USDT",
+    "amount": "3000",
+    "event_type": "NEW_DOWNSTREAM_DESTINATION"
+  }
+}
