@@ -1,0 +1,2755 @@
+"""
+CryptoTrace Exchange Intelligence Module
+=========================================
+
+Purpose
+-------
+Maintain curated external intelligence about exchange-associated blockchain
+addresses while strictly separating that intelligence from observed
+blockchain facts.
+
+The module NEVER infers exchange ownership merely from transaction behavior.
+
+Classification:
+    VERIFIED
+    PROBABLE
+    UNKNOWN
+
+Address types:
+    DEPOSIT_ADDRESS
+    HOT_WALLET
+    COLD_WALLET
+    WITHDRAWAL_ADDRESS
+    CONTRACT
+    UNKNOWN
+
+Important semantics
+-------------------
+OBSERVED BLOCKCHAIN FACT
+    A fact directly observed in canonical blockchain transaction data.
+
+EXTERNAL INTELLIGENCE MATCH
+    A curated external intelligence record exactly matching:
+        chain + address + address_type + source
+    with source provenance and verification date.
+
+ANALYTICAL INFERENCE
+    A downstream analytical conclusion derived by another engine.
+
+This module itself only produces EXTERNAL INTELLIGENCE MATCH results.
+It does not claim:
+    - human ownership
+    - legal ownership
+    - identity
+    - criminal control
+    - criminal activity
+
+Dependencies:
+    Python standard library only.
+
+Example:
+    service = ExchangeIntelligenceService()
+
+    service.register_exchange(
+        exchange_id="binance",
+        name="Binance",
+    )
+
+    service.add_intelligence_record(
+        exchange_id="binance",
+        address="0x123",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="curated_seed",
+        source_reference="seed-001",
+        verified_at="2026-01-15",
+    )
+
+    result = service.match_address(
+        address="0x123",
+        chain="ethereum",
+    )
+"""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from enum import Enum
+from io import StringIO
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class Classification(str, Enum):
+    VERIFIED = "VERIFIED"
+    PROBABLE = "PROBABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+class AddressType(str, Enum):
+    DEPOSIT_ADDRESS = "DEPOSIT_ADDRESS"
+    HOT_WALLET = "HOT_WALLET"
+    COLD_WALLET = "COLD_WALLET"
+    WITHDRAWAL_ADDRESS = "WITHDRAWAL_ADDRESS"
+    CONTRACT = "CONTRACT"
+    UNKNOWN = "UNKNOWN"
+
+
+class EvidenceLayer(str, Enum):
+    OBSERVED_BLOCKCHAIN_FACT = "OBSERVED BLOCKCHAIN FACT"
+    EXTERNAL_INTELLIGENCE_MATCH = "EXTERNAL INTELLIGENCE MATCH"
+    ANALYTICAL_INFERENCE = "ANALYTICAL INFERENCE"
+
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class ExchangeIntelligenceError(Exception):
+    """Base exception for the intelligence module."""
+
+
+class DuplicateIntelligenceRecordError(
+    ExchangeIntelligenceError
+):
+    """Raised when an identical intelligence record already exists."""
+
+
+class InvalidIntelligenceRecordError(
+    ExchangeIntelligenceError
+):
+    """Raised when an intelligence record is invalid."""
+
+
+class ConflictingIntelligenceRecordError(
+    ExchangeIntelligenceError
+):
+    """
+    Raised when records create an unresolved conflict for the same
+    exact address/type/source identity.
+    """
+
+
+class ExchangeNotFoundError(
+    ExchangeIntelligenceError
+):
+    """Raised when an exchange does not exist."""
+
+
+# ============================================================================
+# SOURCE QUALITY
+# ============================================================================
+
+@dataclass(frozen=True)
+class SourceQuality:
+    """
+    Defines how much confidence the system gives to an intelligence source.
+
+    quality_score:
+        0.0 - 1.0
+
+    The score is about source reliability, not ownership certainty.
+    """
+
+    source: str
+    quality_score: float
+    description: str = ""
+
+
+class IntelligenceSourceRegistry:
+    """
+    Abstract source-quality registry.
+
+    A commercial/public provider can replace this implementation later
+    without changing ExchangeIntelligenceService.
+    """
+
+    DEFAULT_QUALITY = 0.50
+
+    def __init__(
+        self,
+        sources: Optional[
+            Iterable[SourceQuality]
+        ] = None,
+    ):
+        self._sources: Dict[
+            str,
+            SourceQuality,
+        ] = {}
+
+        for source in sources or []:
+            self.register(
+                source.source,
+                source.quality_score,
+                source.description,
+            )
+
+    def register(
+        self,
+        source: str,
+        quality_score: float,
+        description: str = "",
+    ) -> None:
+
+        source = self._normalize_source(source)
+
+        if not source:
+            raise ValueError(
+                "source must not be empty"
+            )
+
+        quality_score = float(
+            quality_score
+        )
+
+        if not 0.0 <= quality_score <= 1.0:
+            raise ValueError(
+                "quality_score must be between 0 and 1"
+            )
+
+        self._sources[source] = SourceQuality(
+            source=source,
+            quality_score=quality_score,
+            description=description,
+        )
+
+    def quality(
+        self,
+        source: str,
+    ) -> float:
+
+        source = self._normalize_source(
+            source
+        )
+
+        record = self._sources.get(
+            source
+        )
+
+        if record is None:
+            return self.DEFAULT_QUALITY
+
+        return record.quality_score
+
+    @staticmethod
+    def _normalize_source(
+        source: str,
+    ) -> str:
+        return str(source).strip().lower()
+
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+@dataclass(frozen=True)
+class ExchangeEntity:
+    exchange_id: str
+    name: str
+    jurisdiction: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class IntelligenceProvenance:
+    """
+    Every intelligence record must have provenance.
+    """
+
+    source: str
+    source_reference: str
+    verified_at: str
+
+    imported_at: str
+
+    provider_type: str = "CURATED"
+
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExchangeIntelligenceRecord:
+    """
+    External intelligence record.
+
+    Record identity intentionally includes:
+
+        chain
+        address
+        address_type
+        source
+        verification date
+
+    This prevents silently treating different source claims as the
+    same evidence.
+    """
+
+    exchange_id: str
+
+    address: str
+    chain: str
+
+    address_type: AddressType
+
+    classification: Classification
+
+    provenance: IntelligenceProvenance
+
+    confidence: float
+
+    record_id: str
+
+
+@dataclass(frozen=True)
+class MatchEvidence:
+    """
+    Evidence returned to downstream Attribution/Risk engines.
+    """
+
+    evidence_layer: EvidenceLayer
+
+    exchange: Dict[str, Any]
+
+    address: str
+    chain: str
+    address_type: str
+
+    classification: str
+
+    source: str
+    source_reference: str
+
+    confidence: float
+    verified_at: str
+
+    provenance: Dict[str, Any]
+
+    evidence_status: str
+
+
+# ============================================================================
+# PROVIDER ABSTRACTION
+# ============================================================================
+
+class IntelligenceProvider:
+    """
+    Abstract provider interface.
+
+    Future providers can implement this interface:
+
+        - commercial blockchain intelligence provider
+        - public exchange-address dataset
+        - internal analyst-curated dataset
+        - regulator/public source
+
+    The service does not depend on a specific provider.
+    """
+
+    provider_name = "abstract"
+
+    def records(
+        self,
+    ) -> Iterable[
+        ExchangeIntelligenceRecord
+    ]:
+        raise NotImplementedError
+
+
+class CuratedDatasetProvider(
+    IntelligenceProvider
+):
+    """
+    Seed dataset provider.
+
+    Can be initialized from Python records and can also be populated
+    through CSV/JSON import helpers in the service.
+    """
+
+    provider_name = "curated"
+
+    def __init__(
+        self,
+        records: Optional[
+            Iterable[
+                ExchangeIntelligenceRecord
+            ]
+        ] = None,
+    ):
+        self._records = list(
+            records or []
+        )
+
+    def records(
+        self,
+    ) -> Iterable[
+        ExchangeIntelligenceRecord
+    ]:
+        return list(self._records)
+
+    def add(
+        self,
+        record: ExchangeIntelligenceRecord,
+    ) -> None:
+        self._records.append(record)
+
+
+# ============================================================================
+# STORAGE
+# ============================================================================
+
+class ExchangeIntelligenceRepository:
+    """
+    In-memory repository.
+
+    Replaceable by PostgreSQL, SQLite, document storage, etc.
+
+    The repository stores intelligence records only.
+    It does not store or modify raw blockchain transactions.
+    """
+
+    def __init__(self):
+        self._exchanges: Dict[
+            str,
+            ExchangeEntity,
+        ] = {}
+
+        self._records: Dict[
+            str,
+            ExchangeIntelligenceRecord,
+        ] = {}
+
+        # Exact lookup index:
+        #
+        # chain + address
+        #
+        # Multiple intelligence records may exist for the same address
+        # because different sources may disagree.
+        self._address_index: Dict[
+            Tuple[str, str],
+            List[str],
+        ] = {}
+
+    # ------------------------------------------------------------------
+    # Exchanges
+    # ------------------------------------------------------------------
+
+    def add_exchange(
+        self,
+        exchange: ExchangeEntity,
+    ) -> None:
+
+        exchange_id = self._normalize(
+            exchange.exchange_id
+        )
+
+        if not exchange_id:
+            raise ValueError(
+                "exchange_id must not be empty"
+            )
+
+        self._exchanges[
+            exchange_id
+        ] = exchange
+
+    def get_exchange(
+        self,
+        exchange_id: str,
+    ) -> Optional[ExchangeEntity]:
+
+        return self._exchanges.get(
+            self._normalize(exchange_id)
+        )
+
+    # ------------------------------------------------------------------
+    # Intelligence records
+    # ------------------------------------------------------------------
+
+    def add_record(
+        self,
+        record: ExchangeIntelligenceRecord,
+    ) -> None:
+
+        if record.exchange_id not in self._exchanges:
+            raise ExchangeNotFoundError(
+                f"Unknown exchange: {record.exchange_id}"
+            )
+
+        if record.record_id in self._records:
+            raise DuplicateIntelligenceRecordError(
+                f"Duplicate intelligence record: "
+                f"{record.record_id}"
+            )
+
+        self._records[
+            record.record_id
+        ] = record
+
+        lookup_key = (
+            self._normalize(record.chain),
+            self._normalize_address(
+                record.address
+            ),
+        )
+
+        self._address_index.setdefault(
+            lookup_key,
+            [],
+        ).append(
+            record.record_id
+        )
+
+        # Deterministic ordering.
+        self._address_index[
+            lookup_key
+        ].sort()
+
+    def records_for_address(
+        self,
+        address: str,
+        chain: str,
+    ) -> List[
+        ExchangeIntelligenceRecord
+    ]:
+
+        key = (
+            self._normalize(chain),
+            self._normalize_address(address),
+        )
+
+        record_ids = self._address_index.get(
+            key,
+            [],
+        )
+
+        return [
+            self._records[record_id]
+            for record_id in sorted(record_ids)
+        ]
+
+    def all_records(
+        self,
+    ) -> List[
+        ExchangeIntelligenceRecord
+    ]:
+        return [
+            self._records[key]
+            for key in sorted(self._records)
+        ]
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        return str(value).strip().lower()
+
+    @staticmethod
+    def _normalize_address(
+        address: str,
+    ) -> str:
+        """
+        Address normalization is deliberately conservative.
+
+        We strip surrounding whitespace and normalize case for matching.
+
+        No checksum conversion or chain-specific transformation is
+        performed here because address formats differ between networks.
+        """
+        return str(address).strip().lower()
+
+
+# ============================================================================
+# SERVICE
+# ============================================================================
+
+class ExchangeIntelligenceService:
+    """
+    Main Exchange Intelligence service.
+
+    Public API:
+
+        match_address(address, chain)
+
+        register_exchange(...)
+
+        add_intelligence_record(...)
+
+        import_csv(...)
+
+        import_json(...)
+
+    Core rule:
+
+        An address is classified as an exchange-associated address only
+        when it has an exact curated intelligence record.
+
+    Transaction volume, transaction count, counterparties, etc. are NOT
+    used to infer exchange ownership.
+    """
+
+    ALGORITHM_VERSION = (
+        "cryptotrace-exchange-intelligence-v1"
+    )
+
+    def __init__(
+        self,
+        repository: Optional[
+            ExchangeIntelligenceRepository
+        ] = None,
+        source_registry: Optional[
+            IntelligenceSourceRegistry
+        ] = None,
+        provider: Optional[
+            IntelligenceProvider
+        ] = None,
+    ):
+
+        self.repository = (
+            repository
+            or ExchangeIntelligenceRepository()
+        )
+
+        self.source_registry = (
+            source_registry
+            or self._default_source_registry()
+        )
+
+        self.provider = (
+            provider
+            or CuratedDatasetProvider()
+        )
+
+        # Load provider seed records.
+        for record in self.provider.records():
+            self.repository.add_record(
+                record
+            )
+
+    # ------------------------------------------------------------------
+    # Exchange management
+    # ------------------------------------------------------------------
+
+    def register_exchange(
+        self,
+        exchange_id: str,
+        name: str,
+        jurisdiction: Optional[str] = None,
+        metadata: Optional[
+            Dict[str, Any]
+        ] = None,
+    ) -> ExchangeEntity:
+
+        exchange_id = (
+            self._normalize(exchange_id)
+        )
+
+        exchange = ExchangeEntity(
+            exchange_id=exchange_id,
+            name=str(name).strip(),
+            jurisdiction=jurisdiction,
+            metadata=(
+                dict(metadata)
+                if metadata
+                else None
+            ),
+        )
+
+        self.repository.add_exchange(
+            exchange
+        )
+
+        return exchange
+
+    def get_exchange(
+        self,
+        exchange_id: str,
+    ) -> Optional[ExchangeEntity]:
+
+        return self.repository.get_exchange(
+            exchange_id
+        )
+
+    # ------------------------------------------------------------------
+    # Source management
+    # ------------------------------------------------------------------
+
+    def register_source(
+        self,
+        source: str,
+        quality_score: float,
+        description: str = "",
+    ) -> None:
+
+        self.source_registry.register(
+            source=source,
+            quality_score=quality_score,
+            description=description,
+        )
+
+    # ------------------------------------------------------------------
+    # Add intelligence
+    # ------------------------------------------------------------------
+
+    def add_intelligence_record(
+        self,
+        *,
+        exchange_id: str,
+        address: str,
+        chain: str,
+        address_type: str,
+        classification: str,
+        source: str,
+        source_reference: str,
+        verified_at: str,
+        notes: Optional[str] = None,
+        provider_type: str = "CURATED",
+        imported_at: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> ExchangeIntelligenceRecord:
+
+        exchange_id = self._normalize(
+            exchange_id
+        )
+
+        address = str(address).strip()
+
+        chain = self._normalize(
+            chain
+        )
+
+        address_type_enum = (
+            self._parse_address_type(
+                address_type
+            )
+        )
+
+        classification_enum = (
+            self._parse_classification(
+                classification
+            )
+        )
+
+        source = self._normalize(
+            source
+        )
+
+        source_reference = str(
+            source_reference
+        ).strip()
+
+        verified_at = self._validate_date(
+            verified_at,
+            "verified_at",
+        )
+
+        imported_at = (
+            imported_at
+            or self._utc_now()
+        )
+
+        imported_at = self._validate_date(
+            imported_at,
+            "imported_at",
+            allow_datetime=True,
+        )
+
+        if not address:
+            raise InvalidIntelligenceRecordError(
+                "address must not be empty"
+            )
+
+        if not chain:
+            raise InvalidIntelligenceRecordError(
+                "chain must not be empty"
+            )
+
+        if not source:
+            raise InvalidIntelligenceRecordError(
+                "source must not be empty"
+            )
+
+        if not source_reference:
+            raise InvalidIntelligenceRecordError(
+                "source_reference is required"
+            )
+
+        if not self.repository.get_exchange(
+            exchange_id
+        ):
+            raise ExchangeNotFoundError(
+                f"Unknown exchange: {exchange_id}"
+            )
+
+        # Calculate confidence from source quality unless explicitly
+        # supplied. Even an explicit confidence is bounded.
+        source_quality = (
+            self.source_registry.quality(
+                source
+            )
+        )
+
+        calculated_confidence = (
+            source_quality
+            * self._classification_factor(
+                classification_enum
+            )
+            * self._freshness_factor(
+                verified_at
+            )
+            * 100.0
+        )
+
+        if confidence is None:
+            final_confidence = (
+                calculated_confidence
+            )
+        else:
+            final_confidence = float(
+                confidence
+            )
+
+            if not (
+                0.0
+                <= final_confidence
+                <= 100.0
+            ):
+                raise InvalidIntelligenceRecordError(
+                    "confidence must be between 0 and 100"
+                )
+
+        final_confidence = round(
+            max(
+                0.0,
+                min(
+                    100.0,
+                    final_confidence,
+                ),
+            ),
+            2,
+        )
+
+        record_id = (
+            self._record_id(
+                exchange_id=exchange_id,
+                address=address,
+                chain=chain,
+                address_type=address_type_enum.value,
+                classification=classification_enum.value,
+                source=source,
+                source_reference=source_reference,
+                verified_at=verified_at,
+            )
+        )
+
+        provenance = (
+            IntelligenceProvenance(
+                source=source,
+                source_reference=source_reference,
+                verified_at=verified_at,
+                imported_at=imported_at,
+                provider_type=provider_type,
+                notes=notes,
+            )
+        )
+
+        record = ExchangeIntelligenceRecord(
+            exchange_id=exchange_id,
+            address=address,
+            chain=chain,
+            address_type=address_type_enum,
+            classification=classification_enum,
+            provenance=provenance,
+            confidence=final_confidence,
+            record_id=record_id,
+        )
+
+        self.repository.add_record(
+            record
+        )
+
+        return record
+
+    # ------------------------------------------------------------------
+    # Exact address matching
+    # ------------------------------------------------------------------
+
+    def match_address(
+        self,
+        address: str,
+        chain: str,
+    ) -> Dict[str, Any]:
+
+        address = str(address).strip()
+
+        chain = self._normalize(
+            chain
+        )
+
+        records = (
+            self.repository.records_for_address(
+                address,
+                chain,
+            )
+        )
+
+        if not records:
+            return {
+                "matched": False,
+                "exchange": None,
+                "address": address,
+                "chain": chain,
+                "address_type": (
+                    AddressType.UNKNOWN.value
+                ),
+                "classification": (
+                    Classification.UNKNOWN.value
+                ),
+                "source": None,
+                "source_reference": None,
+                "confidence": 0.0,
+                "verified_at": None,
+                "evidence_layer": (
+                    EvidenceLayer
+                    .EXTERNAL_INTELLIGENCE_MATCH
+                    .value
+                ),
+                "evidence": [],
+                "conflicts": [],
+            }
+
+        # Group by address type and source.
+        #
+        # Multiple sources are allowed and are explicitly preserved.
+        #
+        # Never silently merge contradictory intelligence.
+        grouped: Dict[
+            Tuple[str, str],
+            List[ExchangeIntelligenceRecord],
+        ] = {}
+
+        for record in records:
+            key = (
+                record.address_type.value,
+                record.provenance.source,
+            )
+
+            grouped.setdefault(
+                key,
+                [],
+            ).append(record)
+
+        evidence = []
+
+        for key in sorted(grouped):
+            group = sorted(
+                grouped[key],
+                key=lambda record: (
+                    record.provenance.verified_at,
+                    record.record_id,
+                ),
+                reverse=True,
+            )
+
+            selected = group[0]
+
+            exchange = (
+                self.repository.get_exchange(
+                    selected.exchange_id
+                )
+            )
+
+            if exchange is None:
+                continue
+
+            evidence.append(
+                self._record_to_evidence(
+                    selected,
+                    exchange,
+                )
+            )
+
+        # Determine primary result deterministically.
+        #
+        # Ranking:
+        #   1. confidence
+        #   2. classification
+        #   3. verification date
+        #   4. source
+        #   5. exchange ID
+        #
+        # Conflicts remain visible in "conflicts".
+        ranked = sorted(
+            evidence,
+            key=lambda item: (
+                -float(
+                    item["confidence"]
+                ),
+                self._classification_rank(
+                    item["classification"]
+                ),
+                item["verified_at"] or "",
+                item["source"] or "",
+                item["exchange"]["exchange_id"],
+            ),
+        )
+
+        primary = ranked[0]
+
+        conflicts = self._find_conflicts(
+            records
+        )
+
+        return {
+            "matched": True,
+            "exchange": primary[
+                "exchange"
+            ],
+            "address": address,
+            "chain": chain,
+            "address_type": primary[
+                "address_type"
+            ],
+            "classification": primary[
+                "classification"
+            ],
+            "source": primary[
+                "source"
+            ],
+            "source_reference": primary[
+                "source_reference"
+            ],
+            "confidence": primary[
+                "confidence"
+            ],
+            "verified_at": primary[
+                "verified_at"
+            ],
+            "evidence_layer": (
+                EvidenceLayer
+                .EXTERNAL_INTELLIGENCE_MATCH
+                .value
+            ),
+            "evidence": ranked,
+            "conflicts": conflicts,
+            "has_conflicting_intelligence": bool(
+                conflicts
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # CSV import
+    # ------------------------------------------------------------------
+
+    def import_csv(
+        self,
+        csv_data: str,
+        *,
+        provider_type: str = "CURATED",
+    ) -> Dict[str, Any]:
+        """
+        Import CSV intelligence records.
+
+        Required columns:
+
+            exchange_id
+            address
+            chain
+            address_type
+            classification
+            source
+            source_reference
+            verified_at
+
+        Optional:
+
+            notes
+            imported_at
+            confidence
+        """
+
+        reader = csv.DictReader(
+            StringIO(csv_data)
+        )
+
+        imported = []
+        duplicates = []
+        rejected = []
+
+        for row_number, row in enumerate(
+            reader,
+            start=2,
+        ):
+            try:
+                record = (
+                    self.add_intelligence_record(
+                        exchange_id=row[
+                            "exchange_id"
+                        ],
+                        address=row[
+                            "address"
+                        ],
+                        chain=row[
+                            "chain"
+                        ],
+                        address_type=row[
+                            "address_type"
+                        ],
+                        classification=row[
+                            "classification"
+                        ],
+                        source=row[
+                            "source"
+                        ],
+                        source_reference=row[
+                            "source_reference"
+                        ],
+                        verified_at=row[
+                            "verified_at"
+                        ],
+                        notes=row.get(
+                            "notes"
+                        ),
+                        provider_type=provider_type,
+                        imported_at=row.get(
+                            "imported_at"
+                        ) or None,
+                        confidence=(
+                            float(
+                                row[
+                                    "confidence"
+                                ]
+                            )
+                            if row.get(
+                                "confidence"
+                            )
+                            not in (
+                                None,
+                                "",
+                            )
+                            else None
+                        ),
+                    )
+                )
+
+                imported.append(
+                    record.record_id
+                )
+
+            except DuplicateIntelligenceRecordError as exc:
+                duplicates.append(
+                    {
+                        "row": row_number,
+                        "error": str(exc),
+                    }
+                )
+
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "row": row_number,
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "imported_count": len(
+                imported
+            ),
+            "duplicate_count": len(
+                duplicates
+            ),
+            "rejected_count": len(
+                rejected
+            ),
+            "imported_record_ids": imported,
+            "duplicates": duplicates,
+            "rejected": rejected,
+        }
+
+    # ------------------------------------------------------------------
+    # JSON import
+    # ------------------------------------------------------------------
+
+    def import_json(
+        self,
+        json_data: str | Sequence[Mapping[str, Any]],
+        *,
+        provider_type: str = "CURATED",
+    ) -> Dict[str, Any]:
+        """
+        Import a JSON array of intelligence records.
+
+        Accepts either:
+
+            '[{...}, {...}]'
+
+        or a Python sequence of mappings.
+        """
+
+        if isinstance(
+            json_data,
+            str,
+        ):
+            payload = json.loads(
+                json_data
+            )
+        else:
+            payload = list(
+                json_data
+            )
+
+        if not isinstance(
+            payload,
+            list,
+        ):
+            raise InvalidIntelligenceRecordError(
+                "JSON intelligence dataset must be an array"
+            )
+
+        imported = []
+        duplicates = []
+        rejected = []
+
+        for index, row in enumerate(
+            payload
+        ):
+            try:
+                if not isinstance(
+                    row,
+                    Mapping,
+                ):
+                    raise InvalidIntelligenceRecordError(
+                        "Each JSON record must be an object"
+                    )
+
+                record = (
+                    self.add_intelligence_record(
+                        exchange_id=row[
+                            "exchange_id"
+                        ],
+                        address=row[
+                            "address"
+                        ],
+                        chain=row[
+                            "chain"
+                        ],
+                        address_type=row[
+                            "address_type"
+                        ],
+                        classification=row[
+                            "classification"
+                        ],
+                        source=row[
+                            "source"
+                        ],
+                        source_reference=row[
+                            "source_reference"
+                        ],
+                        verified_at=row[
+                            "verified_at"
+                        ],
+                        notes=row.get(
+                            "notes"
+                        ),
+                        provider_type=row.get(
+                            "provider_type",
+                            provider_type,
+                        ),
+                        imported_at=row.get(
+                            "imported_at"
+                        ),
+                        confidence=row.get(
+                            "confidence"
+                        ),
+                    )
+                )
+
+                imported.append(
+                    record.record_id
+                )
+
+            except DuplicateIntelligenceRecordError as exc:
+                duplicates.append(
+                    {
+                        "index": index,
+                        "error": str(exc),
+                    }
+                )
+
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "index": index,
+                        "error": str(exc),
+                    }
+                )
+
+        return {
+            "imported_count": len(
+                imported
+            ),
+            "duplicate_count": len(
+                duplicates
+            ),
+            "rejected_count": len(
+                rejected
+            ),
+            "imported_record_ids": imported,
+            "duplicates": duplicates,
+            "rejected": rejected,
+        }
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_json(
+        self,
+    ) -> str:
+        """
+        Export intelligence records without transaction data.
+        """
+
+        records = []
+
+        for record in self.repository.all_records():
+            item = asdict(record)
+
+            item[
+                "address_type"
+            ] = record.address_type.value
+
+            item[
+                "classification"
+            ] = record.classification.value
+
+            records.append(
+                item
+            )
+
+        return json.dumps(
+            records,
+            indent=2,
+            sort_keys=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Evidence helpers
+    # ------------------------------------------------------------------
+
+    def _record_to_evidence(
+        self,
+        record: ExchangeIntelligenceRecord,
+        exchange: ExchangeEntity,
+    ) -> Dict[str, Any]:
+
+        return {
+            "evidence_layer": (
+                EvidenceLayer
+                .EXTERNAL_INTELLIGENCE_MATCH
+                .value
+            ),
+            "exchange": {
+                "exchange_id": exchange.exchange_id,
+                "name": exchange.name,
+                "jurisdiction": (
+                    exchange.jurisdiction
+                ),
+            },
+            "address": record.address,
+            "chain": record.chain,
+            "address_type": (
+                record.address_type.value
+            ),
+            "classification": (
+                record.classification.value
+            ),
+            "source": (
+                record.provenance.source
+            ),
+            "source_reference": (
+                record.provenance.source_reference
+            ),
+            "confidence": record.confidence,
+            "verified_at": (
+                record.provenance.verified_at
+            ),
+            "provenance": {
+                "source": (
+                    record.provenance.source
+                ),
+                "source_reference": (
+                    record.provenance.source_reference
+                ),
+                "verified_at": (
+                    record.provenance.verified_at
+                ),
+                "imported_at": (
+                    record.provenance.imported_at
+                ),
+                "provider_type": (
+                    record.provenance.provider_type
+                ),
+                "notes": (
+                    record.provenance.notes
+                ),
+            },
+            "evidence_status": (
+                "Curated external intelligence; "
+                "not proof of ownership, identity, "
+                "control, or criminal activity."
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Conflict handling
+    # ------------------------------------------------------------------
+
+    def _find_conflicts(
+        self,
+        records: Sequence[
+            ExchangeIntelligenceRecord
+        ],
+    ) -> List[Dict[str, Any]]:
+
+        conflicts = []
+
+        for index, record_a in enumerate(
+            records
+        ):
+            for record_b in records[
+                index + 1:
+            ]:
+
+                # Conflict when independently sourced records disagree
+                # on exchange or classification/address type.
+                if (
+                    record_a.provenance.source
+                    == record_b.provenance.source
+                    and record_a.provenance.source_reference
+                    == record_b.provenance.source_reference
+                ):
+                    continue
+
+                if (
+                    record_a.exchange_id
+                    != record_b.exchange_id
+                    or record_a.classification
+                    != record_b.classification
+                    or record_a.address_type
+                    != record_b.address_type
+                ):
+                    conflicts.append(
+                        {
+                            "record_a": (
+                                self._record_summary(
+                                    record_a
+                                )
+                            ),
+                            "record_b": (
+                                self._record_summary(
+                                    record_b
+                                )
+                            ),
+                            "resolution": (
+                                "Preserved as conflicting "
+                                "external intelligence; "
+                                "primary result selected "
+                                "deterministically by "
+                                "confidence and evidence "
+                                "ranking."
+                            ),
+                        }
+                    )
+
+        return conflicts
+
+    @staticmethod
+    def _record_summary(
+        record: ExchangeIntelligenceRecord,
+    ) -> Dict[str, Any]:
+
+        return {
+            "record_id": record.record_id,
+            "exchange_id": record.exchange_id,
+            "address": record.address,
+            "chain": record.chain,
+            "address_type": (
+                record.address_type.value
+            ),
+            "classification": (
+                record.classification.value
+            ),
+            "source": (
+                record.provenance.source
+            ),
+            "source_reference": (
+                record.provenance.source_reference
+            ),
+            "verified_at": (
+                record.provenance.verified_at
+            ),
+            "confidence": record.confidence,
+        }
+
+    # ------------------------------------------------------------------
+    # Confidence calculation
+    # ------------------------------------------------------------------
+
+    def calculate_intelligence_confidence(
+        self,
+        *,
+        source: str,
+        classification: str,
+        verified_at: str,
+    ) -> float:
+        """
+        Public confidence calculation.
+
+        Formula:
+
+            source_quality
+                × classification_factor
+                × freshness_factor
+                × 100
+
+        This is confidence in the intelligence evidence, not confidence
+        in human/legal ownership.
+        """
+
+        classification_enum = (
+            self._parse_classification(
+                classification
+            )
+        )
+
+        verified_at = self._validate_date(
+            verified_at,
+            "verified_at",
+        )
+
+        confidence = (
+            self.source_registry.quality(
+                source
+            )
+            * self._classification_factor(
+                classification_enum
+            )
+            * self._freshness_factor(
+                verified_at
+            )
+            * 100.0
+        )
+
+        return round(
+            max(
+                0.0,
+                min(
+                    100.0,
+                    confidence,
+                ),
+            ),
+            2,
+        )
+
+    @staticmethod
+    def _classification_factor(
+        classification: Classification,
+    ) -> float:
+
+        return {
+            Classification.VERIFIED: 1.00,
+            Classification.PROBABLE: 0.75,
+            Classification.UNKNOWN: 0.25,
+        }[classification]
+
+    @staticmethod
+    def _classification_rank(
+        classification: str,
+    ) -> int:
+
+        return {
+            Classification.VERIFIED.value: 0,
+            Classification.PROBABLE.value: 1,
+            Classification.UNKNOWN.value: 2,
+        }.get(
+            classification,
+            3,
+        )
+
+    @staticmethod
+    def _freshness_factor(
+        verified_at: str,
+    ) -> float:
+        """
+        Freshness penalty.
+
+        This deliberately does not delete old intelligence.
+
+        Age:
+            <= 365 days: 1.00
+            <= 730 days: 0.90
+            <= 1095 days: 0.75
+            > 1095 days: 0.60
+
+        The original verification date remains intact and visible.
+        """
+
+        try:
+            verified = (
+                datetime.fromisoformat(
+                    verified_at.replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+            )
+
+            if verified.tzinfo is None:
+                verified = verified.replace(
+                    tzinfo=timezone.utc
+                )
+
+            now = datetime.now(
+                timezone.utc
+            )
+
+            age_days = max(
+                0,
+                (
+                    now - verified
+                ).days,
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return 0.50
+
+        if age_days <= 365:
+            return 1.00
+
+        if age_days <= 730:
+            return 0.90
+
+        if age_days <= 1095:
+            return 0.75
+
+        return 0.60
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_classification(
+        value: str,
+    ) -> Classification:
+
+        try:
+            return Classification(
+                str(value)
+                .strip()
+                .upper()
+            )
+        except ValueError:
+            raise InvalidIntelligenceRecordError(
+                f"Invalid classification: {value}"
+            )
+
+    @staticmethod
+    def _parse_address_type(
+        value: str,
+    ) -> AddressType:
+
+        try:
+            return AddressType(
+                str(value)
+                .strip()
+                .upper()
+            )
+        except ValueError:
+            raise InvalidIntelligenceRecordError(
+                f"Invalid address_type: {value}"
+            )
+
+    @staticmethod
+    def _validate_date(
+        value: str,
+        field_name: str,
+        allow_datetime: bool = False,
+    ) -> str:
+
+        value = str(value).strip()
+
+        if not value:
+            raise InvalidIntelligenceRecordError(
+                f"{field_name} is required"
+            )
+
+        try:
+            parsed = datetime.fromisoformat(
+                value.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+            if (
+                parsed.tzinfo is None
+                and allow_datetime
+            ):
+                parsed = parsed.replace(
+                    tzinfo=timezone.utc
+                )
+
+        except ValueError:
+            raise InvalidIntelligenceRecordError(
+                f"Invalid {field_name}: {value}"
+            )
+
+        return value
+
+    @staticmethod
+    def _utc_now() -> str:
+        return (
+            datetime.now(
+                timezone.utc
+            )
+            .isoformat()
+        )
+
+    @staticmethod
+    def _normalize(
+        value: str,
+    ) -> str:
+        return str(value).strip().lower()
+
+    # ------------------------------------------------------------------
+    # Stable record ID
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _record_id(
+        *,
+        exchange_id: str,
+        address: str,
+        chain: str,
+        address_type: str,
+        classification: str,
+        source: str,
+        source_reference: str,
+        verified_at: str,
+    ) -> str:
+
+        """
+        Record identity includes the required matching dimensions:
+
+            chain
+            address
+            address_type
+            source
+            verification date
+
+        Additional fields are included to prevent two distinct curated
+        claims from being silently collapsed.
+        """
+
+        identity = "|".join(
+            [
+                exchange_id.strip().lower(),
+                chain.strip().lower(),
+                address.strip().lower(),
+                address_type.strip().upper(),
+                source.strip().lower(),
+                source_reference.strip(),
+                verified_at.strip(),
+                classification.strip().upper(),
+            ]
+        )
+
+        digest = hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+
+        return f"intel-{digest[:24]}"
+
+    # ------------------------------------------------------------------
+    # Default source registry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_source_registry(
+    ) -> IntelligenceSourceRegistry:
+
+        return IntelligenceSourceRegistry(
+            [
+                SourceQuality(
+                    source="official_exchange",
+                    quality_score=0.98,
+                    description=(
+                        "Official exchange-published address information."
+                    ),
+                ),
+                SourceQuality(
+                    source="regulator",
+                    quality_score=0.98,
+                    description=(
+                        "Regulatory/public authority source."
+                    ),
+                ),
+                SourceQuality(
+                    source="curated_seed",
+                    quality_score=0.90,
+                    description=(
+                        "Manually reviewed curated intelligence dataset."
+                    ),
+                ),
+                SourceQuality(
+                    source="public_dataset",
+                    quality_score=0.80,
+                    description=(
+                        "Publicly available third-party dataset."
+                    ),
+                ),
+                SourceQuality(
+                    source="analyst",
+                    quality_score=0.75,
+                    description=(
+                        "Internal analyst-curated intelligence."
+                    ),
+                ),
+            ]
+        )
+
+
+# ============================================================================
+# RISK ENGINE ADAPTER
+# ============================================================================
+
+class ExchangeIntelligenceRiskAdapter:
+    """
+    Converts intelligence results into a Risk Engine-compatible record.
+
+    The Risk Engine should treat this as an evidence signal rather than
+    proof of wrongdoing.
+    """
+
+    @staticmethod
+    def to_risk_signal(
+        match_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+
+        if not match_result.get(
+            "matched",
+            False,
+        ):
+            return {
+                "signal_type": (
+                    "EXTERNAL_INTELLIGENCE_MATCH"
+                ),
+                "matched": False,
+                "risk_relevance": "NONE",
+                "confidence": 0.0,
+                "evidence_layer": (
+                    EvidenceLayer
+                    .EXTERNAL_INTELLIGENCE_MATCH
+                    .value
+                ),
+            }
+
+        return {
+            "signal_type": (
+                "EXTERNAL_INTELLIGENCE_MATCH"
+            ),
+            "matched": True,
+            "exchange": match_result[
+                "exchange"
+            ],
+            "address": match_result[
+                "address"
+            ],
+            "chain": match_result[
+                "chain"
+            ],
+            "address_type": match_result[
+                "address_type"
+            ],
+            "classification": match_result[
+                "classification"
+            ],
+            "confidence": match_result[
+                "confidence"
+            ],
+            "source": match_result[
+                "source"
+            ],
+            "source_reference": match_result[
+                "source_reference"
+            ],
+            "verified_at": match_result[
+                "verified_at"
+            ],
+            "has_conflicting_intelligence": (
+                match_result.get(
+                    "has_conflicting_intelligence",
+                    False,
+                )
+            ),
+            "evidence_layer": (
+                EvidenceLayer
+                .EXTERNAL_INTELLIGENCE_MATCH
+                .value
+            ),
+            "risk_semantics": (
+                "External intelligence association only. "
+                "Not evidence of criminal activity, "
+                "identity, ownership, or control."
+            ),
+        }
+
+
+# ============================================================================
+# ATTRIBUTION ENGINE ADAPTER
+# ============================================================================
+
+class ExchangeIntelligenceAttributionAdapter:
+    """
+    Converts intelligence results into an Attribution Engine-compatible
+    evidence object.
+    """
+
+    @staticmethod
+    def to_attribution_evidence(
+        match_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+
+        if not match_result.get(
+            "matched",
+            False,
+        ):
+            return {
+                "attribution_type": "NONE",
+                "address": match_result[
+                    "address"
+                ],
+                "chain": match_result[
+                    "chain"
+                ],
+                "evidence_layer": (
+                    EvidenceLayer
+                    .EXTERNAL_INTELLIGENCE_MATCH
+                    .value
+                ),
+                "confidence": 0.0,
+                "evidence": [],
+            }
+
+        return {
+            "attribution_type": (
+                "EXCHANGE_ASSOCIATION"
+            ),
+            "address": match_result[
+                "address"
+            ],
+            "chain": match_result[
+                "chain"
+            ],
+            "exchange": match_result[
+                "exchange"
+            ],
+            "address_type": match_result[
+                "address_type"
+            ],
+            "classification": match_result[
+                "classification"
+            ],
+            "confidence": match_result[
+                "confidence"
+            ],
+            "evidence_layer": (
+                EvidenceLayer
+                .EXTERNAL_INTELLIGENCE_MATCH
+                .value
+            ),
+            "source": match_result[
+                "source"
+            ],
+            "source_reference": match_result[
+                "source_reference"
+            ],
+            "verified_at": match_result[
+                "verified_at"
+            ],
+            "all_evidence": match_result[
+                "evidence"
+            ],
+            "conflicts": match_result[
+                "conflicts"
+            ],
+            "attribution_semantics": (
+                "Exchange-associated address according "
+                "to external intelligence. This does not "
+                "establish human/legal ownership, identity, "
+                "criminal control, or criminal activity."
+            ),
+        }
+
+
+# ============================================================================
+# FRONTEND EVIDENCE ADAPTER
+# ============================================================================
+
+class EvidencePresentationAdapter:
+    """
+    Frontend-compatible representation that explicitly separates the
+    three evidence layers.
+
+    This prevents UI consumers from displaying an intelligence match
+    as if it were a blockchain fact.
+    """
+
+    @staticmethod
+    def observed_blockchain_fact(
+        *,
+        address: str,
+        chain: str,
+        transaction_count: int,
+        inbound_volume: float,
+        outbound_volume: float,
+    ) -> Dict[str, Any]:
+
+        return {
+            "evidence_layer": (
+                EvidenceLayer
+                .OBSERVED_BLOCKCHAIN_FACT
+                .value
+            ),
+            "address": address,
+            "chain": chain,
+            "facts": {
+                "transaction_count": (
+                    transaction_count
+                ),
+                "inbound_volume": (
+                    inbound_volume
+                ),
+                "outbound_volume": (
+                    outbound_volume
+                ),
+            },
+        }
+
+    @staticmethod
+    def external_intelligence_match(
+        match_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+
+        return {
+            "evidence_layer": (
+                EvidenceLayer
+                .EXTERNAL_INTELLIGENCE_MATCH
+                .value
+            ),
+            "matched": match_result[
+                "matched"
+            ],
+            "exchange": match_result[
+                "exchange"
+            ],
+            "address": match_result[
+                "address"
+            ],
+            "chain": match_result[
+                "chain"
+            ],
+            "address_type": match_result[
+                "address_type"
+            ],
+            "classification": match_result[
+                "classification"
+            ],
+            "source": match_result[
+                "source"
+            ],
+            "source_reference": match_result[
+                "source_reference"
+            ],
+            "confidence": match_result[
+                "confidence"
+            ],
+            "verified_at": match_result[
+                "verified_at"
+            ],
+            "label": (
+                "External intelligence match"
+            ),
+            "warning": (
+                "This is external intelligence, "
+                "not an observed blockchain fact."
+            ),
+        }
+
+    @staticmethod
+    def analytical_inference(
+        *,
+        statement: str,
+        confidence: float,
+        supporting_evidence: List[
+            Dict[str, Any]
+        ],
+    ) -> Dict[str, Any]:
+
+        confidence = max(
+            0.0,
+            min(
+                100.0,
+                float(confidence),
+            ),
+        )
+
+        return {
+            "evidence_layer": (
+                EvidenceLayer
+                .ANALYTICAL_INFERENCE
+                .value
+            ),
+            "statement": statement,
+            "confidence": round(
+                confidence,
+                2,
+            ),
+            "supporting_evidence": (
+                supporting_evidence
+            ),
+            "label": (
+                "Analytical inference"
+            ),
+            "warning": (
+                "This is an analytical inference and "
+                "must not be represented as a direct "
+                "blockchain fact."
+            ),
+        }
+
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+def _test_service() -> ExchangeIntelligenceService:
+
+    source_registry = (
+        IntelligenceSourceRegistry()
+    )
+
+    source_registry.register(
+        "official_exchange",
+        0.98,
+    )
+
+    source_registry.register(
+        "public_dataset",
+        0.80,
+    )
+
+    source_registry.register(
+        "old_dataset",
+        0.80,
+    )
+
+    source_registry.register(
+        "analyst",
+        0.75,
+    )
+
+    service = ExchangeIntelligenceService(
+        source_registry=source_registry
+    )
+
+    service.register_exchange(
+        "exchange_a",
+        "Exchange A",
+    )
+
+    service.register_exchange(
+        "exchange_b",
+        "Exchange B",
+    )
+
+    return service
+
+
+def test_exact_match():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="official-001",
+        verified_at="2026-01-01",
+    )
+
+    result = service.match_address(
+        "0xABC",
+        "ethereum",
+    )
+
+    assert result["matched"] is True
+    assert result["exchange"][
+        "exchange_id"
+    ] == "exchange_a"
+
+    assert (
+        result["address_type"]
+        == "HOT_WALLET"
+    )
+
+    assert (
+        result["classification"]
+        == "VERIFIED"
+    )
+
+    assert (
+        result["source"]
+        == "official_exchange"
+    )
+
+    assert (
+        result["source_reference"]
+        == "official-001"
+    )
+
+    assert (
+        0 <= result["confidence"] <= 100
+    )
+
+
+def test_non_match():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="official-001",
+        verified_at="2026-01-01",
+    )
+
+    result = service.match_address(
+        "0xUNKNOWN",
+        "ethereum",
+    )
+
+    assert result["matched"] is False
+    assert result["exchange"] is None
+    assert (
+        result["classification"]
+        == "UNKNOWN"
+    )
+    assert result["confidence"] == 0.0
+
+
+def test_same_address_on_different_networks():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="eth-001",
+        verified_at="2026-01-01",
+    )
+
+    service.add_intelligence_record(
+        exchange_id="exchange_b",
+        address="0xABC",
+        chain="polygon",
+        address_type="HOT_WALLET",
+        classification="PROBABLE",
+        source="public_dataset",
+        source_reference="polygon-001",
+        verified_at="2026-01-01",
+    )
+
+    ethereum_result = (
+        service.match_address(
+            "0xABC",
+            "ethereum",
+        )
+    )
+
+    polygon_result = (
+        service.match_address(
+            "0xABC",
+            "polygon",
+        )
+    )
+
+    bitcoin_result = (
+        service.match_address(
+            "0xABC",
+            "bitcoin",
+        )
+    )
+
+    assert ethereum_result[
+        "exchange"
+    ]["exchange_id"] == "exchange_a"
+
+    assert polygon_result[
+        "exchange"
+    ]["exchange_id"] == "exchange_b"
+
+    assert bitcoin_result[
+        "matched"
+    ] is False
+
+
+def test_multiple_intelligence_sources():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="PROBABLE",
+        source="public_dataset",
+        source_reference="public-001",
+        verified_at="2026-01-01",
+    )
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="official-001",
+        verified_at="2026-02-01",
+    )
+
+    result = service.match_address(
+        "0xABC",
+        "ethereum",
+    )
+
+    assert result["matched"] is True
+
+    # Both sources are retained.
+    assert len(
+        result["evidence"]
+    ) == 2
+
+    assert (
+        result["source"]
+        == "official_exchange"
+    )
+
+    assert (
+        result["classification"]
+        == "VERIFIED"
+    )
+
+
+def test_outdated_source():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xOLD",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="old_dataset",
+        source_reference="old-001",
+        verified_at="2020-01-01",
+    )
+
+    result = service.match_address(
+        "0xOLD",
+        "ethereum",
+    )
+
+    assert result["matched"] is True
+
+    # Still a valid intelligence record, but freshness reduces confidence.
+    assert (
+        result["confidence"]
+        < 100.0
+    )
+
+    assert (
+        result["verified_at"]
+        == "2020-01-01"
+    )
+
+
+def test_conflicting_source_records():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xCONFLICT",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="official-001",
+        verified_at="2026-01-01",
+    )
+
+    service.add_intelligence_record(
+        exchange_id="exchange_b",
+        address="0xCONFLICT",
+        chain="ethereum",
+        address_type="DEPOSIT_ADDRESS",
+        classification="PROBABLE",
+        source="public_dataset",
+        source_reference="public-001",
+        verified_at="2026-01-01",
+    )
+
+    result = service.match_address(
+        "0xCONFLICT",
+        "ethereum",
+    )
+
+    assert result["matched"] is True
+
+    assert (
+        result[
+            "has_conflicting_intelligence"
+        ]
+        is True
+    )
+
+    assert len(
+        result["conflicts"]
+    ) >= 1
+
+    # Conflict is not silently discarded.
+    assert len(
+        result["evidence"]
+    ) == 2
+
+
+def test_duplicate_intelligence_record():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xDUP",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="dup-001",
+        verified_at="2026-01-01",
+    )
+
+    try:
+        service.add_intelligence_record(
+            exchange_id="exchange_a",
+            address="0xDUP",
+            chain="ethereum",
+            address_type="HOT_WALLET",
+            classification="VERIFIED",
+            source="official_exchange",
+            source_reference="dup-001",
+            verified_at="2026-01-01",
+        )
+
+        assert False, (
+            "Expected DuplicateIntelligenceRecordError"
+        )
+
+    except DuplicateIntelligenceRecordError:
+        pass
+
+
+def test_csv_import():
+
+    service = _test_service()
+
+    csv_data = """exchange_id,address,chain,address_type,classification,source,source_reference,verified_at
+exchange_a,0xCSV1,ethereum,HOT_WALLET,VERIFIED,official_exchange,csv-001,2026-01-01
+exchange_a,0xCSV2,ethereum,COLD_WALLET,PROBABLE,public_dataset,csv-002,2026-01-01
+"""
+
+    result = service.import_csv(
+        csv_data
+    )
+
+    assert result[
+        "imported_count"
+    ] == 2
+
+    assert (
+        service.match_address(
+            "0xCSV1",
+            "ethereum",
+        )["matched"]
+        is True
+    )
+
+
+def test_json_import():
+
+    service = _test_service()
+
+    json_data = json.dumps(
+        [
+            {
+                "exchange_id": "exchange_a",
+                "address": "0xJSON1",
+                "chain": "ethereum",
+                "address_type": "DEPOSIT_ADDRESS",
+                "classification": "VERIFIED",
+                "source": "official_exchange",
+                "source_reference": "json-001",
+                "verified_at": "2026-01-01",
+            }
+        ]
+    )
+
+    result = service.import_json(
+        json_data
+    )
+
+    assert result[
+        "imported_count"
+    ] == 1
+
+    match = service.match_address(
+        "0xJSON1",
+        "ethereum",
+    )
+
+    assert match[
+        "matched"
+    ] is True
+
+
+def test_confidence_bounded():
+
+    service = _test_service()
+
+    for classification in (
+        "VERIFIED",
+        "PROBABLE",
+        "UNKNOWN",
+    ):
+        confidence = (
+            service.calculate_intelligence_confidence(
+                source="official_exchange",
+                classification=classification,
+                verified_at="2026-01-01",
+            )
+        )
+
+        assert (
+            0.0
+            <= confidence
+            <= 100.0
+        )
+
+
+def test_frontend_evidence_layers():
+
+    service = _test_service()
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xUI",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="ui-001",
+        verified_at="2026-01-01",
+    )
+
+    match = service.match_address(
+        "0xUI",
+        "ethereum",
+    )
+
+    frontend = (
+        EvidencePresentationAdapter
+        .external_intelligence_match(
+            match
+        )
+    )
+
+    assert (
+        frontend["evidence_layer"]
+        == "EXTERNAL INTELLIGENCE MATCH"
+    )
+
+    assert (
+        frontend["warning"]
+        != ""
+    )
+
+
+def test_intelligence_does_not_depend_on_transaction_volume():
+
+    """
+    Critical negative test.
+
+    An address being present in a transaction dataset must NOT
+    automatically create an exchange intelligence match.
+    """
+
+    service = _test_service()
+
+    # No intelligence record exists.
+    #
+    # Even if an upstream blockchain engine reports that this address
+    # has thousands of transactions, this service returns UNKNOWN.
+    result = service.match_address(
+        "0xHIGHVOLUME",
+        "ethereum",
+    )
+
+    assert result[
+        "matched"
+    ] is False
+
+    assert (
+        result["classification"]
+        == "UNKNOWN"
+    )
+
+    assert (
+        result["confidence"]
+        == 0.0
+    )
+
+
+# ============================================================================
+# DEMONSTRATION
+# ============================================================================
+
+if __name__ == "__main__":
+
+    service = ExchangeIntelligenceService()
+
+    # --------------------------------------------------------------
+    # Exchange entities
+    # --------------------------------------------------------------
+
+    service.register_exchange(
+        exchange_id="exchange_a",
+        name="Example Exchange",
+        jurisdiction="Global",
+    )
+
+    # --------------------------------------------------------------
+    # Intelligence source
+    # --------------------------------------------------------------
+
+    service.register_source(
+        source="official_exchange",
+        quality_score=0.98,
+        description=(
+            "Official exchange-published address information."
+        ),
+    )
+
+    # --------------------------------------------------------------
+    # Curated intelligence
+    # --------------------------------------------------------------
+
+    service.add_intelligence_record(
+        exchange_id="exchange_a",
+        address="0xABC123",
+        chain="ethereum",
+        address_type="HOT_WALLET",
+        classification="VERIFIED",
+        source="official_exchange",
+        source_reference="official-page-001",
+        verified_at="2026-01-15",
+        notes=(
+            "Address published by exchange as a hot wallet."
+        ),
+    )
+
+    # --------------------------------------------------------------
+    # Exact match
+    # --------------------------------------------------------------
+
+    result = service.match_address(
+        address="0xABC123",
+        chain="ethereum",
+    )
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            default=str,
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Risk Engine
+    # --------------------------------------------------------------
+
+    risk_signal = (
+        ExchangeIntelligenceRiskAdapter
+        .to_risk_signal(
+            result
+        )
+    )
+
+    print(
+        json.dumps(
+            risk_signal,
+            indent=2,
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Attribution Engine
+    # --------------------------------------------------------------
+
+    attribution = (
+        ExchangeIntelligenceAttributionAdapter
+        .to_attribution_evidence(
+            result
+        )
+    )
+
+    print(
+        json.dumps(
+            attribution,
+            indent=2,
+        )
+    )
