@@ -1,4 +1,4 @@
-from security import hash_value
+from aksada.module18.security import hash_value
 
 
 def test_hash_value():

@@ -23,7 +23,7 @@ async function request(endpoint, options = {}) {
     throw new Error(message);
   }
 
-  return response.json();
+  return response.status === 204 ? null : response.json();
 }
 
 export const api = {
